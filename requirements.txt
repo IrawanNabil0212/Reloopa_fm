@@ -1,0 +1,6 @@
+fastapi==0.103.2
+spotdl>=4.2.5
+requests
+aiofiles
+google-auth
+itsdangerous
