@@ -10,7 +10,7 @@ Variabel lingkungan (opsional):
     MAX_CONCURRENT_JOBS                        -> jumlah job paralel (default 2)
     ZIP_TTL_FREE / ZIP_TTL_PREMIUM             -> umur file zip (default 600 / 3600 detik)
     GOOGLE_CLIENT_ID, SESSION_SECRET           -> login Google & cookie sesi
-    MIDTRANS_SERVER_KEY                        -> pembayaran (lihat payments.py)
+    MIDTRANS_SERVER_KEY, MIDTRANS_CLIENT_KEY   -> pembayaran (lihat payments.py)
     FREE_LIMIT / PREMIUM_WEEKLY_LIMIT / PASS_LIMIT -> batas kuota (lihat quota.py)
     RATE_LIMIT_IP / RATE_LIMIT_USER            -> maks permintaan unduh per 10 menit
 """
@@ -31,9 +31,9 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from google.auth.exceptions import TransportError
 from google.auth.transport import requests as google_requests
@@ -43,11 +43,16 @@ from requests.exceptions import RequestException
 from spotdl import Spotdl
 from starlette.middleware.sessions import SessionMiddleware
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import db
 import quota
+import cover  # <- custom cover (Premium)
 from db import init_db, is_premium, upsert_user
-from payments import router as payments_router
 from ratelimit import RateLimiter, client_ip
+from payments import router as payments_router, pages_router
+
 
 # --------------------------------------------------------------------------- #
 # Konfigurasi
@@ -337,8 +342,14 @@ def _spawn(coro) -> None:
     task.add_done_callback(_BG_TASKS.discard)
 
 
-async def process_session(session_id: str, spotify_url: str, user_id: str, plan: dict) -> None:
-    """Pipeline: download -> zip -> catat kuota -> jadwalkan penghapusan."""
+async def process_session(
+    session_id: str,
+    spotify_url: str,
+    user_id: str,
+    plan: dict,
+    cover_bytes: bytes | None = None,  # <- baru
+) -> None:
+    """Pipeline: download -> (embed cover) -> zip -> catat kuota -> jadwalkan penghapusan."""
     session = SESSIONS.get(session_id)
     if session is None:
         await asyncio.to_thread(quota.release, session_id)
@@ -350,6 +361,33 @@ async def process_session(session_id: str, spotify_url: str, user_id: str, plan:
         _, success_ids = await download_spotify_album(
             spotify_url, session_id, set(plan["selected_ids"])
         )
+
+        # --- baru: sematkan custom cover (Premium) ---
+        print(
+            f"[PIPELINE] {session_id[:8]} | cover_bytes={'ada, ' + str(len(cover_bytes)) + ' byte' if cover_bytes else 'None'} "
+            f"| AUDIO_FORMAT={AUDIO_FORMAT}",
+            flush=True,
+        )
+        if cover_bytes:
+            await emit(session_id, "Menyematkan custom cover...")
+            ok, failed = await asyncio.to_thread(
+                cover.embed_cover_in_folder, DOWNLOADS_DIR / session_id, cover_bytes
+            )
+            if ok == 0:
+                await emit(
+                    session_id,
+                    "Custom cover tidak dapat diterapkan (hanya didukung untuk format MP3).",
+                    level="warning",
+                )
+            elif failed:
+                await emit(
+                    session_id,
+                    f"Cover disematkan ke {ok} lagu, {failed} lagu gagal.",
+                    level="warning",
+                )
+            else:
+                await emit(session_id, f"Custom cover disematkan ke {ok} lagu.")
+        # ---------------------------------------------
 
         await emit(session_id, "Mengompresi file menjadi ZIP...", status="zipping")
         await create_zip(session_id)
@@ -446,14 +484,15 @@ app.add_middleware(
 )
 
 app.include_router(payments_router)
-
-
-class DownloadRequest(BaseModel):
-    url: str
+app.include_router(pages_router)
 
 
 @app.post("/api/download")
-async def start_download(body: DownloadRequest, request: Request):
+async def start_download(
+    request: Request,
+    url: str = Form(...),
+    cover_image: UploadFile | None = File(None),
+):
     # 1. Wajib login (frontend menangkap code "login_required" -> popup Google,
     #    simpan URL, lalu panggil ulang endpoint ini setelah login)
     user = request.session.get("user")
@@ -464,8 +503,37 @@ async def start_download(body: DownloadRequest, request: Request):
         )
     enforce_rate_limit(request, user["id"])
 
+    print(
+        f"[DOWNLOAD] user={user['id']} | cover_image diterima: {cover_image is not None} | "
+        f"filename={getattr(cover_image, 'filename', None)!r} | "
+        f"content_type={getattr(cover_image, 'content_type', None)!r}",
+        flush=True,
+    )
+
+    # 1b. Custom cover (khusus Premium/Pass): validasi SEBELUM kuota dipesan
+    cover_bytes: bytes | None = None
+    if cover_image is not None and cover_image.filename:
+        try:
+            st = await asyncio.to_thread(quota.get_status, user["id"])
+            if st["tier"] == "free":
+                print(f"[DOWNLOAD] Cover DITOLAK: tier={st['tier']}", flush=True)
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "detail": "Custom cover hanya untuk pengguna Premium.",
+                        "code": "premium_required",
+                    },
+                )
+            try:
+                cover_bytes = (await cover.validate_cover_upload(cover_image)).data
+                print(f"[DOWNLOAD] tier={st['tier']} | cover tervalidasi: {len(cover_bytes)} byte", flush=True)
+            except cover.CoverError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+        finally:
+            await cover_image.close()
+
     # 2. Ambil daftar lagu (dari cache album-info kalau ada)
-    _, _, url = parse_spotify_url(body.url)
+    _, _, url = parse_spotify_url(url)
     info = await fetch_album_info(url)
     track_ids = [t["id"] for t in info["tracks"] if t.get("id")]
     if not track_ids:
@@ -505,7 +573,13 @@ async def start_download(body: DownloadRequest, request: Request):
         await JOB_QUEUE.put((
             priority,
             next(_JOB_SEQ),
-            {"session_id": session_id, "spotify_url": url, "user_id": user["id"], "plan": plan},
+            {
+                "session_id": session_id,
+                "spotify_url": url,
+                "user_id": user["id"],
+                "plan": plan,
+                "cover_bytes": cover_bytes,  # <- baru
+            },
         ))
     except Exception:
         SESSIONS.pop(session_id, None)
@@ -699,6 +773,48 @@ async def qris_page(request: Request):
     if not page.is_file():
         raise HTTPException(status_code=404, detail="static/qris.html tidak ditemukan.")
     return FileResponse(page)
+
+@app.get("/premium/kartu", include_in_schema=False)
+async def kartu_page(request: Request):
+    if not request.session.get("user"):
+        return RedirectResponse("/")
+    page = STATIC_DIR / "kartu.html"
+    if not page.is_file():
+        raise HTTPException(status_code=404, detail="static/kartu.html tidak ditemukan.")
+    return FileResponse(page)
+
+
+@app.get("/pembayaran/sukses", include_in_schema=False)
+async def pembayaran_sukses(request: Request, order_id: str = ""):
+    user = request.session.get("user")
+    if not user:
+        return RedirectResponse("/")
+
+    # Hanya tampil untuk order milik user ini yang benar-benar sudah lunas
+    order = db.get_order(order_id) if order_id else None
+    if not order or order["user_id"] != user["id"] or order["status"] != "paid":
+        return RedirectResponse("/premium")
+
+    nama = "Premium" if order["product"] == "premium" else "Unlimited Pass"
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="id"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pembayaran berhasil</title>
+<style>
+  body{{margin:0;min-height:100dvh;display:grid;place-items:center;padding:24px;
+       font-family:Inter,system-ui,sans-serif;background:#e9eaee;color:#0f0f12}}
+  .card{{max-width:420px;width:100%;padding:32px 24px;text-align:center;background:#fff;
+        border-radius:18px;box-shadow:0 8px 30px rgba(20,20,40,.12)}}
+  h1{{font-size:24px;margin:16px 0 8px}}
+  p{{color:#3f4047;line-height:1.5;margin:0 0 24px}}
+  a{{display:block;padding:14px;border-radius:14px;background:#684ca0;color:#fff;
+    font-weight:700;text-decoration:none}}
+</style></head><body><main class="card">
+<svg width="56" height="56" viewBox="0 0 24 24" fill="none" stroke="#684ca0" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 12.5l3 3 5-6"/></svg>
+<h1>Pembayaran berhasil</h1>
+<p>Paket {nama} sudah aktif di akun kamu.</p>
+<a href="/">Kembali ke beranda</a></main></body></html>""")
 
 
 # --------------------------------------------------------------------------- #

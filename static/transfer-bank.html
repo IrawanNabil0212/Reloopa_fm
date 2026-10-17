@@ -198,6 +198,37 @@
   }
 
   @media (prefers-reduced-motion: reduce) { .menu, .scrim, .burger svg line, .toast, .bank, .radio::after, .pay { transition: none; } }
+
+    /* ===== Tampilan instruksi pembayaran (setelah order dibuat) ===== */
+  .bank.is-static { cursor: default; }
+  .bank.is-static:hover { background: #fff; }
+  .codes {
+    margin-top: 14px; padding: 8px 16px 16px; background: #fff; border-radius: 16px;
+    box-shadow: 0 2px 14px rgba(20, 20, 40, .05);
+  }
+  .code-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-bottom: 1px solid #eef0f4; }
+  .code-row:last-of-type { border-bottom: 0; }
+  .code-label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; }
+  .code-val { display: block; font-size: 20px; font-weight: 800; letter-spacing: .04em; overflow-wrap: anywhere; }
+  .codes .copy { width: 36px; height: 36px; flex: none; background: var(--row); color: var(--ink); }
+  .meta { margin-top: 10px; font-size: 13px; color: var(--muted); }
+  .meta b { color: var(--ink); font-variant-numeric: tabular-nums; }
+  .status { margin-top: 8px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .status::before {
+    content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--gold);
+    animation: pulse 1.2s ease-in-out infinite;
+  }
+  .status.ok { color: #1a8f4c; }
+  .status.ok::before { background: #1a8f4c; animation: none; }
+  .status.bad { color: #c0392b; }
+  .status.bad::before { background: #c0392b; animation: none; }
+  .link-btn {
+    margin-top: 12px; padding: 0; border: 0; background: none; font: inherit; font-size: 13px;
+    font-weight: 600; color: #6c5ce7; cursor: pointer; text-decoration: underline;
+  }
+  @keyframes pulse { 50% { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .status::before { animation: none; } }
+
 </style>
 </head>
 <body>
@@ -259,11 +290,19 @@
 </div>
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
-
 <script>
 const $ = id => document.getElementById(id);
+const SUCCESS_URL = '/';              // tujuan setelah pembayaran berhasil (ubah sesuai kebutuhan)
+const POLL_MS = 4000;
 
-// Halaman ini khusus user yang sudah login
+const params = new URLSearchParams(location.search);
+const PRODUCT = ['premium', 'pass'].includes(params.get('product')) ? params.get('product') : 'premium';
+let orderId = params.get('order');
+
+const rupiah = n => 'Rp' + Number(n).toLocaleString('id-ID');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// ---- Cek login ----
 fetch('/api/auth/me')
   .then(r => { if (!r.ok) throw new Error('belum login'); return r.json(); })
   .then(u => {
@@ -273,37 +312,26 @@ fetch('/api/auth/me')
   })
   .catch(() => location.replace('/'));
 
-// ---- Data bank (nomor VA masih dummy sesuai desain) ----
-const BANKS = [
-  { id: 'bca',     name: 'BCA Virtual Account',        logo: '/static/img/bca.svg',     prefix: '12345', phone: '08123456789' },
-  { id: 'mandiri', name: 'Mandiri Virtual Account',    logo: '/static/img/mandiri.png', prefix: '89508', phone: '08123456789' },
-  { id: 'bri',     name: 'BRI Virtual Account (BRIVA)', logo: '/static/img/bri.png',    prefix: '12888', phone: '08123456789' },
-  { id: 'bni',     name: 'BNI Virtual Account',        logo: '/static/img/bni.png',     prefix: '8810',  phone: '08123456789' },
-];
-
-// ---- Harga dari paket yang dipilih user: /premium/transfer-bank?harga=100000 ----
-function readPrice() {
-  const n = Number(new URLSearchParams(location.search).get('harga'));
-  return Number.isInteger(n) && n > 0 ? n : 100000;
+// ---- Helper API ----
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (r.status === 401) { location.replace('/'); throw new Error('Belum login.'); }
+  let data = {};
+  try { data = await r.json(); } catch { /* body kosong */ }
+  if (!r.ok) throw new Error(data.detail || 'Terjadi kesalahan. Coba lagi.');
+  return data;
 }
-const price = readPrice();
-const rupiah = n => 'Rp' + n.toLocaleString('id-ID');
-$('total').textContent = rupiah(price);
 
-// ---- Render daftar bank ----
-const COPY_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>';
-$('banks').innerHTML = BANKS.map(b => `
-  <label class="bank">
-    <input type="radio" name="bank" value="${b.id}">
-    <span class="logo"><img src="${b.logo}" alt="${b.name.split(' ')[0]}"></span>
-    <span class="info">
-      <strong>${b.name}</strong>
-      <span class="va">${b.prefix} ${b.phone}
-        <button type="button" class="copy" data-copy="${b.prefix}${b.phone}" aria-label="Salin nomor ${b.name}">${COPY_ICON}</button>
-      </span>
-    </span>
-    <span class="radio" aria-hidden="true"></span>
-  </label>`).join('');
+// ---- Data bank (tanpa nomor VA dummy) ----
+const BANKS = [
+  { id: 'bca',     name: 'BCA Virtual Account',         logo: '/static/img/bca.svg' },
+  { id: 'mandiri', name: 'Mandiri Virtual Account',     logo: '/static/img/mandiri.png' },
+  { id: 'bri',     name: 'BRI Virtual Account (BRIVA)', logo: '/static/img/bri.png' },
+  { id: 'bni',     name: 'BNI Virtual Account',         logo: '/static/img/bni.png' },
+];
+const bankById = id => BANKS.find(b => b.id === id);
+
+const COPY_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>';
 
 // ---- Toast ----
 let toastTimer;
@@ -312,15 +340,200 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2400);
 }
 
-// ---- Salin nomor VA (tanpa memilih baris) ----
+// ---- Harga: sumber utama dari server, cadangan dari ?harga= ----
+function setTotal(n) { if (Number.isFinite(Number(n)) && Number(n) > 0) $('total').textContent = rupiah(n); }
+const priceFromUrl = Number(params.get('harga'));
+if (Number.isInteger(priceFromUrl) && priceFromUrl > 0) setTotal(priceFromUrl);
+fetch('/api/payments/products')
+  .then(r => r.ok ? r.json() : Promise.reject())
+  .then(p => { if (!orderId && p[PRODUCT]) setTotal(p[PRODUCT].price); })
+  .catch(() => {});
+
+// ---- Mode UI ----
+let mode = 'select';   // 'select' | 'check' | 'restart'
+const pay = $('pay');
+function setPayButton(text, enabled, newMode) {
+  pay.textContent = text;
+  pay.setAttribute('aria-disabled', enabled ? 'false' : 'true');
+  if (newMode) mode = newMode;
+}
+
+// ---- Tampilan 1: pilih bank ----
+function renderSelect() {
+  stopPolling(); stopCountdown();
+  $('pick-label').textContent = 'Pilih Pembayaran :';
+  $('banks').setAttribute('role', 'radiogroup');
+  $('banks').innerHTML = BANKS.map(b => `
+    <label class="bank">
+      <input type="radio" name="bank" value="${b.id}">
+      <span class="logo"><img src="${b.logo}" alt="${esc(b.name.split(' ')[0])}"></span>
+      <span class="info"><strong>${esc(b.name)}</strong></span>
+      <span class="radio" aria-hidden="true"></span>
+    </label>`).join('');
+  setPayButton('Bayar Sekarang', false, 'select');
+}
+$('banks').addEventListener('change', () => { if (mode === 'select') setPayButton('Bayar Sekarang', true); });
+
+// ---- Tampilan 2: instruksi pembayaran ----
+let expiresAt = null, countdownTimer = null;
+
+function codeRow(label, value) {
+  return `
+    <div class="code-row">
+      <div><span class="code-label">${esc(label)}</span><strong class="code-val">${esc(value)}</strong></div>
+      <button type="button" class="copy" data-copy="${esc(value)}" aria-label="Salin ${esc(label)}">${COPY_ICON}</button>
+    </div>`;
+}
+
+function renderInstructions(d) {
+  const bank = bankById(d.bank) || { name: String(d.bank || 'Bank').toUpperCase(), logo: '' };
+  const rows = d.bill_key
+    ? codeRow('Kode Perusahaan', d.biller_code) + codeRow('Kode Pembayaran', d.bill_key)
+    : codeRow('Nomor Virtual Account', d.va_number);
+
+  $('pick-label').textContent = 'Selesaikan Pembayaran :';
+  $('banks').removeAttribute('role');
+  $('banks').innerHTML = `
+    <div class="bank is-static">
+      <span class="logo">${bank.logo ? `<img src="${bank.logo}" alt="">` : ''}</span>
+      <span class="info"><strong>${esc(bank.name)}</strong></span>
+    </div>
+    <div class="codes">
+      ${rows}
+      <p class="meta" id="metaExpiry" hidden>Bayar sebelum <b id="countdown">--:--</b></p>
+      <p class="status" id="status">Menunggu pembayaran…</p>
+      <button type="button" class="link-btn" id="changeBank">Ganti bank</button>
+      ${d.sandbox ? '<p class="meta">Mode sandbox: simulasikan pembayaran lewat simulator Midtrans.</p>' : ''}
+    </div>`;
+
+  setTotal(d.amount);
+  $('changeBank').addEventListener('click', restart);
+  setPayButton('Cek Status Pembayaran', true, 'check');
+
+  expiresAt = d.expires_at || null;
+  if (expiresAt) { $('metaExpiry').hidden = false; startCountdown(); }
+}
+
+function setStatus(text, cls) {
+  const s = $('status');
+  if (!s) return;
+  s.textContent = text;
+  s.className = 'status' + (cls ? ' ' + cls : '');
+}
+
+// ---- Countdown ----
+function fmt(sec) {
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const mm = String(m).padStart(2, '0'), ss = String(s).padStart(2, '0');
+  return h ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+function tick() {
+  const el = $('countdown');
+  if (!el || !expiresAt) return;
+  const left = Math.floor(expiresAt - Date.now() / 1000);
+  if (left <= 0) { el.textContent = '00:00'; stopCountdown(); pollOnce(false); return; }  // status akhir tetap dari Midtrans
+  el.textContent = fmt(left);
+}
+function startCountdown() { stopCountdown(); tick(); countdownTimer = setInterval(tick, 1000); }
+function stopCountdown() { clearInterval(countdownTimer); countdownTimer = null; }
+
+// ---- Polling status ----
+let pollTimer = null, polling = false, finished = false;
+
+async function pollOnce(manual) {
+  if (polling || finished || !orderId) return;
+  polling = true;
+  try {
+    const s = await api(`/api/payments/status/${encodeURIComponent(orderId)}`);
+    if (s.status === 'paid') return onPaid();
+    if (s.status === 'expired' || s.status === 'failed') return onDead(s.status);
+    if (manual) toast('Pembayaran belum diterima.');
+  } catch (e) {
+    if (manual) toast(e.message);
+  } finally {
+    polling = false;
+  }
+}
+function startPolling() { stopPolling(); finished = false; pollTimer = setInterval(() => pollOnce(false), POLL_MS); }
+function stopPolling() { clearInterval(pollTimer); pollTimer = null; }
+
+function onPaid() {
+  finished = true; stopPolling(); stopCountdown();
+  setStatus('Pembayaran berhasil! Mengalihkan…', 'ok');
+  setPayButton('Pembayaran Berhasil', false);
+  setTimeout(() => location.replace(SUCCESS_URL), 1500);
+}
+function onDead(status) {
+  finished = true; stopPolling(); stopCountdown();
+  setStatus(status === 'expired' ? 'Pembayaran kedaluwarsa.' : 'Pembayaran dibatalkan / gagal.', 'bad');
+  setPayButton('Pilih Pembayaran Lagi', true, 'restart');
+}
+
+// ---- Kembali ke pilih bank (hapus ?order dari URL) ----
+function restart() {
+  finished = true; stopPolling(); stopCountdown();
+  orderId = null;
+  params.delete('order');
+  history.replaceState(null, '', location.pathname + (params.toString() ? '?' + params : ''));
+  renderSelect();
+}
+
+// ---- Muat ulang instruksi dari order yang sudah ada (?order=...) ----
+async function loadExisting() {
+  try {
+    const d = await api(`/api/payments/instructions/${encodeURIComponent(orderId)}`);
+    if (d.product && d.product !== PRODUCT) params.set('product', d.product);
+    renderInstructions(d);
+    if (d.status === 'paid') return onPaid();
+    if (d.status === 'expired' || d.status === 'failed') return onDead(d.status);
+    startPolling();
+    pollOnce(false);   // cek segera: status lokal bisa tertinggal dari Midtrans
+  } catch (e) {
+    toast(e.message);
+    restart();
+  }
+}
+
+// ---- Klik tombol utama ----
+let busy = false;
+pay.addEventListener('click', async () => {
+  if (busy) return;
+
+  if (mode === 'check') return pollOnce(true);
+  if (mode === 'restart') return restart();
+
+  const chosen = document.querySelector('input[name="bank"]:checked');
+  if (!chosen) return toast('Pilih bank terlebih dahulu');
+
+  busy = true;
+  setPayButton('Memproses…', false);
+  try {
+    const d = await api(
+      `/api/payments/bank-transfer?bank=${encodeURIComponent(chosen.value)}&product=${encodeURIComponent(PRODUCT)}`,
+      { method: 'POST' }
+    );
+    orderId = d.order_id;
+    params.set('order', orderId);
+    params.set('product', PRODUCT);
+    history.replaceState(null, '', location.pathname + '?' + params);   // aman saat di-refresh
+    renderInstructions(d);
+    startPolling();
+  } catch (e) {
+    toast(e.message);
+    setPayButton('Bayar Sekarang', true, 'select');
+  } finally {
+    busy = false;
+  }
+});
+
+// ---- Salin nomor ----
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
   } catch {
-    // Fallback untuk http non-localhost
     const ta = document.createElement('textarea');
     ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
     document.body.appendChild(ta); ta.select();
@@ -332,27 +545,15 @@ async function copyText(text) {
 $('banks').addEventListener('click', async e => {
   const btn = e.target.closest('[data-copy]');
   if (!btn) return;
-  e.preventDefault();   // jangan ikut memilih radio
-  try {
-    await copyText(btn.dataset.copy);
-    toast('Nomor virtual account disalin');
-  } catch {
-    toast('Gagal menyalin, salin manual');
-  }
+  e.preventDefault();
+  try { await copyText(btn.dataset.copy); toast('Berhasil disalin'); }
+  catch { toast('Gagal menyalin, salin manual'); }
 });
 
-// ---- Tombol bayar aktif setelah memilih bank ----
-const pay = $('pay');
-$('banks').addEventListener('change', () => pay.setAttribute('aria-disabled', 'false'));
-pay.addEventListener('click', () => {
-  const chosen = document.querySelector('input[name="bank"]:checked');
-  if (!chosen) return toast('Pilih bank terlebih dahulu');
-  const bank = BANKS.find(b => b.id === chosen.value);
-  // TODO: buat transaksi di backend lalu tampilkan instruksi pembayaran
-  toast('Pembayaran via ' + bank.name.split(' ')[0] + ' segera tersedia');
-});
+// Cek langsung saat tab kembali aktif (browser menunda timer di tab latar)
+document.addEventListener('visibilitychange', () => { if (!document.hidden) pollOnce(false); });
 
-// ---- Menu hamburger ----
+// ---- Menu hamburger (tidak berubah) ----
 const burger = $('burger'), menu = $('menu'), scrim = $('scrim');
 function setMenu(open) {
   menu.classList.toggle('open', open);
@@ -375,6 +576,17 @@ menu.addEventListener('click', async e => {
     location.href = '/';
   }
 });
+
+// ---- Mulai ----
+if (orderId) {
+  $('pick-label').textContent = 'Memuat pembayaran…';
+  $('banks').innerHTML = '';
+  setPayButton('Cek Status Pembayaran', false, 'check');
+  loadExisting();
+} else {
+  renderSelect();
+}
 </script>
+
 </body>
 </html>

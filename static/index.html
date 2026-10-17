@@ -79,6 +79,20 @@
   .user .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .user .uname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+  /* ---------- Badge kuota (sisa lagu) ---------- */
+  .qbadge {
+    display: inline-flex; align-items: center; gap: 4px; flex: none;
+    padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 700; line-height: 1.4; white-space: nowrap;
+    color: #4b3a86;
+    background: rgba(255, 255, 255, .6);
+    border: 1px solid rgba(104, 76, 160, .2);
+    -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  }
+  .qbadge[hidden] { display: none; }
+  .qbadge svg { flex: none; }
+  .qbadge.is-empty { color: #d92d20; background: rgba(217, 45, 32, .08); border-color: rgba(217, 45, 32, .4); }  /* kuota habis */
+
   /* ---------- Menu (panel dari kanan) ---------- */
   .burger { position: relative; z-index: 3; }   /* tetap di atas panel agar bisa menutup */
   .scrim {
@@ -267,6 +281,7 @@
     <div class="user" id="user" hidden>
       <span class="avatar" id="userAvatar"></span>
       <span class="uname" id="userName"></span>
+      <span class="qbadge" id="quotaBadge" hidden title="Sisa kuota unduhan"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg><span class="qtext"></span></span>
     </div>
 
     <button class="burger" id="burger" aria-label="Buka menu" aria-expanded="false" aria-controls="menu">
@@ -390,6 +405,31 @@ menu.addEventListener('click', async e => {
   }
 });
 
+/* ---------- Badge kuota: GET /api/quota -> {"tier":"free","limit":30,"remaining":14} ---------- */
+function renderQuotaBadge(q) {
+  const el = document.getElementById('quotaBadge');
+  if (!el) return;
+  const n = q && typeof q.remaining === 'number' ? q.remaining : null;
+  const unlimited = !!(q && q.unlimited) || (n !== null && n < 0);
+  if (n === null && !unlimited) { el.hidden = true; return; }   // data tidak tersedia: sembunyikan badge
+  const empty = !unlimited && n === 0;                          // habis -> merah
+  el.querySelector('.qtext').textContent = unlimited ? 'Unlimited' : n.toLocaleString('id-ID') + ' Lagu';
+  el.classList.toggle('is-empty', empty);
+  el.title = empty ? 'Kuota unduhan habis'
+    : unlimited ? 'Unduhan tanpa batas'
+    : 'Sisa kuota unduhan' + (q && typeof q.limit === 'number' ? ' (dari ' + q.limit + ' lagu)' : '');
+  el.hidden = false;
+}
+async function loadQuotaBadge() {
+  try {
+    const r = await fetch('/api/quota');
+    if (!r.ok) return null;
+    const q = await r.json();
+    renderQuotaBadge(q);
+    return q;
+  } catch { return null; }
+}
+
 /* ---------- Nama user di topbar ---------- */
 const pageEl = document.getElementById('page');
 const userEl = document.getElementById('user');
@@ -432,10 +472,15 @@ function setLoggedIn(user) {
   logoutBtn.hidden = !user;
   renderUser(user);
   menuUserName.textContent = userNameEl.textContent;
+  if (user) loadQuotaBadge(); else renderQuotaBadge(null);   // badge kuota hanya untuk user login
 }
 fetch('/api/auth/me')
   .then(r => (r.ok ? r.json() : null))
-  .then(setLoggedIn)
+  .then(u => {
+    setLoggedIn(u);
+    if (u) { resumePendingDownload(); return; }                       // sudah login & ada unduhan tertunda
+    if (new URLSearchParams(location.search).get('login') === '1') openLogin();   // dikirim dari halaman album (401)
+  })
   .catch(() => {});
 
 /* ---------- Popup Login Google ---------- */
@@ -452,6 +497,25 @@ function closeLogin() { loginDialog.close(); }
 
 document.getElementById('loginClose').addEventListener('click', closeLogin);
 loginDialog.addEventListener('click', e => { if (e.target === loginDialog) closeLogin(); });
+
+/* ---------- State saver: lanjutkan unduhan setelah login ----------
+   Halaman album menyimpan sessionStorage['pending_download'] = {"returnTo":"/album?url=...&autostart=1"}
+   saat /api/download membalas 401. Setelah login sukses, user dikembalikan ke sana. */
+function takePendingDownload() {
+  try {
+    const raw = sessionStorage.getItem('pending_download');
+    sessionStorage.removeItem('pending_download');
+    const p = raw ? JSON.parse(raw) : null;
+    // hanya terima path internal (cegah open redirect)
+    return p && typeof p.returnTo === 'string' && /^\/(?!\/)/.test(p.returnTo) ? p : null;
+  } catch { return null; }
+}
+function resumePendingDownload() {
+  const p = takePendingDownload();
+  if (p) location.href = p.returnTo;
+}
+// Popup ditutup tanpa login (X / klik luar / Esc) = batal, buang state tertunda
+loginDialog.addEventListener('close', () => { try { sessionStorage.removeItem('pending_download'); } catch {} });
 
 function loadGoogle() {
   gisLoading = true;
@@ -496,8 +560,10 @@ async function handleCredential(resp) {
       body: JSON.stringify({ credential: resp.credential })
     });
     if (!r.ok) throw new Error((await r.json()).detail || 'Login gagal.');
+    const pending = takePendingDownload();   // baca sebelum popup ditutup (event close menghapusnya)
     closeLogin();
     setLoggedIn(await r.json());   // nama user + menu Logout langsung muncul, tanpa reload
+    if (pending) location.href = pending.returnTo;   // lanjut unduh otomatis, tanpa paste link lagi
   } catch (e) {
     loginErr.textContent = e.message;
   }

@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bayar dengan Kartu</title>
+<style>
+  :root { --ink:#0f0f12; --muted:#6f7178; --field:#f1f2f4; --accent:#684ca0; --gold:#e39a12; --danger:#d92d20; }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: #e9eaee; }
+  .page { min-height: 100dvh; background: #fff; display: flex; flex-direction: column; }
+  .wrap { width: 100%; max-width: 720px; margin: 0 auto; padding: calc(18px + env(safe-area-inset-top, 0px)) 24px 0; }
+  .back { display: inline-flex; align-items: center; gap: 6px; margin-left: -8px; padding: 8px 12px 8px 8px; background: none; border: 0; border-radius: 10px; font: inherit; font-size: 14px; font-weight: 600; color: var(--accent); cursor: pointer; }
+  .back:hover { background: rgba(104,76,160,.1); }
+  .eyebrow { display: inline-flex; align-items: center; gap: 8px; margin-top: 16px; font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--accent); }
+  .eyebrow svg { color: var(--gold); }
+  h1 { margin-top: 12px; font-size: 26px; font-weight: 800; line-height: 1.2; letter-spacing: -.01em; }
+  .lead { margin-top: 10px; font-size: 14px; line-height: 1.55; color: #3f4047; }
+
+  form { margin-top: 24px; display: flex; flex-direction: column; gap: 16px; padding: 20px 18px; background: rgba(255,255,255,.9); border: 1px solid rgba(104,76,160,.12); border-radius: 18px; box-shadow: 0 6px 20px rgba(40,20,80,.07); }
+  .field { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 0; }
+  .row { display: flex; gap: 12px; }
+  label { font-size: 13px; font-weight: 600; color: #4b3f6b; }
+  input { width: 100%; padding: 14px; font: inherit; font-size: 16px; color: var(--ink); background: var(--field); border: 1.5px solid transparent; border-radius: 12px; }
+  input::placeholder { color: #a3a6ad; }
+  input:focus { outline: none; border-color: var(--accent); background: #fff; }
+  input.bad { border-color: var(--danger); background: rgba(217,45,32,.05); }
+  .err { min-height: 18px; font-size: 12px; color: var(--danger); }
+  .safe { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+
+  .summary { position: sticky; bottom: 0; margin-top: auto; padding: 24px 24px calc(16px + env(safe-area-inset-bottom, 0px)); background: linear-gradient(to bottom, rgba(255,255,255,0), #fff 22px); }
+  .price { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px; background: #fff; box-shadow: 0 8px 30px rgba(20,20,40,.12); border-radius: 18px; }
+  .price span { font-size: 13px; font-weight: 600; color: #4b3f6b; }
+  .price strong { font-size: 22px; font-weight: 800; }
+  .pay { width: 100%; margin-top: 12px; padding: 16px; display: flex; align-items: center; justify-content: center; gap: 10px; font: inherit; font-size: 16px; font-weight: 700; color: #fff; background: var(--accent); border: 0; border-radius: 16px; cursor: pointer; }
+  .pay:hover:not(:disabled) { background: #5a4090; }
+  .pay:disabled { background: #a79bc4; cursor: not-allowed; }
+  .pay:focus-visible, input:focus-visible, .back:focus-visible { outline: 2px solid #6c5ce7; outline-offset: 2px; }
+  .spin { width: 18px; height: 18px; border: 2.5px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: sp .7s linear infinite; }
+  .spin[hidden] { display: none; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+
+  /* Popup 3D Secure */
+  .tds { position: fixed; inset: 0; z-index: 40; display: none; align-items: center; justify-content: center; padding: 16px; background: rgba(8,8,12,.6); }
+  .tds.open { display: flex; }
+  .tds-box { width: 100%; max-width: 440px; height: min(640px, 90dvh); background: #fff; border-radius: 18px; overflow: hidden; display: flex; flex-direction: column; }
+  .tds-head { padding: 12px 16px; font-size: 13px; font-weight: 600; color: #4b3f6b; border-bottom: 1px solid #eceef1; }
+  .tds iframe { flex: 1; width: 100%; border: 0; }
+
+  .toast { position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 12px); z-index: 50; max-width: calc(100% - 40px); background: var(--ink); color: #fff; font-size: 13px; padding: 10px 16px; border-radius: 12px; opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+  @media (min-width: 600px) {
+    .wrap { padding: 36px 28px 0; }
+    h1 { font-size: 34px; }
+    .lead { font-size: 15px; }
+    form { padding: 24px 22px; }
+    .summary { bottom: 16px; margin: 8px auto 16px; padding: 0 28px; background: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { .spin { animation-duration: 2s; } .toast { transition: none; } }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="wrap">
+    <button class="back" id="backBtn" type="button">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg> Kembali
+    </button>
+
+    <span class="eyebrow"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5L3 8z"/><path d="M5.5 22h13"/></svg>Premium</span>
+    <h1>Bayar dengan kartu kredit atau debit</h1>
+    <p class="lead" id="lead">Masukkan data kartu Visa atau Mastercard kamu.</p>
+
+    <form id="cardForm" novalidate autocomplete="off">
+      <div class="field">
+        <label for="num">Nomor kartu</label>
+        <input id="num" inputmode="numeric" autocomplete="cc-number" placeholder="1234 5678 9012 3456" maxlength="19" required>
+        <span class="err" id="e-num"></span>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label for="exp">Berlaku hingga</label>
+          <input id="exp" inputmode="numeric" autocomplete="cc-exp" placeholder="MM/YY" maxlength="5" required>
+          <span class="err" id="e-exp"></span>
+        </div>
+        <div class="field">
+          <label for="cvv">CVV</label>
+          <input id="cvv" type="password" inputmode="numeric" autocomplete="cc-csc" placeholder="123" maxlength="4" required>
+          <span class="err" id="e-cvv"></span>
+        </div>
+      </div>
+      <p class="safe">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+        Data kartu dikirim langsung ke Midtrans dan tidak disimpan di server kami.
+      </p>
+    </form>
+  </div>
+
+  <div class="wrap summary">
+    <div class="price"><span id="priceLabel">Total tagihan</span><strong id="price">Rp 0</strong></div>
+    <button class="pay" id="payBtn" type="submit" form="cardForm" disabled>
+      <span class="spin" id="spin" hidden></span><span id="payText">Memuat…</span>
+    </button>
+  </div>
+</div>
+
+<div class="tds" id="tds" role="dialog" aria-modal="true" aria-label="Verifikasi 3D Secure">
+  <div class="tds-box">
+    <div class="tds-head">Verifikasi bank (3D Secure). Jangan tutup halaman ini.</div>
+    <iframe id="tdsFrame" title="Verifikasi 3D Secure"></iframe>
+  </div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const qs = new URLSearchParams(location.search);
+const product = qs.get('product') === 'pass' ? 'pass' : 'premium';
+const LABEL = { premium: 'Premium', pass: 'Unlimited Pass' };
+const rupiah = n => new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(n);
+
+let busy = false, ready = false, amount = 0;
+
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove('show'), 3500);
+}
+function setBusy(on, text) {
+  busy = on;
+  $('payBtn').disabled = on || !ready;
+  $('spin').hidden = !on;
+  $('payText').textContent = on ? (text || 'Memproses…') : 'Bayar ' + rupiah(amount);
+}
+function done(url) { location.replace(url); }
+
+/* ---------- Input: format otomatis ---------- */
+$('num').addEventListener('input', e => {
+  e.target.value = e.target.value.replace(/\D/g, '').slice(0, 16).replace(/(\d{4})(?=\d)/g, '$1 ');
+});
+$('exp').addEventListener('input', e => {
+  let v = e.target.value.replace(/\D/g, '').slice(0, 4);
+  if (v.length === 1 && +v > 1) v = '0' + v;
+  e.target.value = v.length > 2 ? v.slice(0, 2) + '/' + v.slice(2) : v;
+});
+$('cvv').addEventListener('input', e => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 4); });
+
+/* ---------- Validasi ---------- */
+function luhn(s) {
+  let sum = 0, alt = false;
+  for (let i = s.length - 1; i >= 0; i--) {
+    let d = +s[i]; if (alt) { d *= 2; if (d > 9) d -= 9; }
+    sum += d; alt = !alt;
+  }
+  return sum % 10 === 0;
+}
+function fail(id, msg) { $(id).classList.add('bad'); $('e-' + id).textContent = msg; return false; }
+function validate() {
+  ['num', 'exp', 'cvv'].forEach(id => { $(id).classList.remove('bad'); $('e-' + id).textContent = ''; });
+  const num = $('num').value.replace(/\s/g, ''), exp = $('exp').value, cvv = $('cvv').value;
+  let ok = true;
+  if (num.length !== 16 || !luhn(num)) ok = fail('num', 'Nomor kartu harus 16 digit dan valid.');
+  const m = /^(\d{2})\/(\d{2})$/.exec(exp);
+  if (!m || +m[1] < 1 || +m[1] > 12) ok = fail('exp', 'Format MM/YY.');
+  else {
+    const now = new Date(), y = 2000 + +m[2];
+    if (y < now.getFullYear() || (y === now.getFullYear() && +m[1] < now.getMonth() + 1)) ok = fail('exp', 'Kartu sudah kedaluwarsa.');
+  }
+  if (cvv.length < 3) ok = fail('cvv', 'CVV 3 atau 4 digit.');
+  return ok ? { num, month: m[1], year: '20' + m[2], cvv } : null;
+}
+
+/* ---------- Midtrans.js ---------- */
+function loadMidtrans(clientKey, sandbox) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.id = 'midtrans-script';
+    s.src = (sandbox ? 'https://api.sandbox.midtrans.com' : 'https://api.midtrans.com') + '/v2/assets/js/midtrans-new-3ds.min.js';
+    s.dataset.environment = sandbox ? 'sandbox' : 'production';
+    s.dataset.clientKey = clientKey;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('Gagal memuat Midtrans.js'));
+    document.head.appendChild(s);
+  });
+}
+function getToken(c) {
+  return new Promise((resolve, reject) => {
+    MidtransNew3ds.getCardToken({
+      card_number: c.num, card_exp_month: c.month, card_exp_year: c.year, card_cvv: c.cvv
+    }, {
+      onSuccess: r => resolve(r.token_id),
+      onFailure: r => reject(new Error((r && r.validation_messages && r.validation_messages[0]) || (r && r.status_message) || 'Kartu tidak dapat diproses.'))
+    });
+  });
+}
+
+/* ---------- 3D Secure ---------- */
+function open3ds(url) {
+  return new Promise((resolve, reject) => {
+    const close = () => { $('tds').classList.remove('open'); $('tdsFrame').src = 'about:blank'; };
+    MidtransNew3ds.authenticate(url, {
+      performAuthentication: u => { $('tdsFrame').src = u; $('tds').classList.add('open'); },
+      onSuccess: () => { close(); resolve(); },
+      onPending: () => { close(); resolve(); },
+      onFailure: r => { close(); reject(new Error((r && r.status_message) || 'Verifikasi 3D Secure gagal.')); }
+    });
+  });
+}
+
+/* ---------- Cek status sampai lunas (status final tetap dari server) ---------- */
+async function waitPaid(orderId) {
+  for (let i = 0; i < 30; i++) {
+    const r = await fetch('/api/payments/status/' + encodeURIComponent(orderId));
+    if (r.status === 401) { location.replace('/'); return false; }
+    const d = await r.json().catch(() => ({}));
+    if (d.status === 'paid') return true;
+    if (d.status === 'failed' || d.status === 'expired') throw new Error('Pembayaran ditolak atau kedaluwarsa. Coba kartu lain.');
+    await new Promise(res => setTimeout(res, 2000));
+  }
+  throw new Error('Pembayaran belum terkonfirmasi. Jika saldo terpotong, cek lagi beberapa menit lagi.');
+}
+
+/* ---------- Submit ---------- */
+$('cardForm').addEventListener('submit', async e => {
+  e.preventDefault();
+  if (busy || !ready) return;
+  const card = validate();
+  if (!card) return;
+  setBusy(true, 'Memverifikasi kartu…');
+  try {
+    const token_id = await getToken(card);
+    ['num', 'exp', 'cvv'].forEach(id => { $(id).value = ''; });   // data kartu tidak perlu disimpan di form lagi
+
+    setBusy(true, 'Memproses pembayaran…');
+    const res = await fetch('/api/payments/card?product=' + product, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token_id })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) { location.replace('/'); return; }
+    if (!res.ok) throw new Error(data.detail || data.message || 'Pembayaran gagal (' + res.status + ')');
+
+    if (data.status === 'paid') return done('/pembayaran/sukses?order_id=' + encodeURIComponent(data.order_id));
+    if (data.status === 'failed') throw new Error('Kartu ditolak oleh bank. Coba kartu lain.');
+
+    if (data.redirect_url) { setBusy(true, 'Menunggu verifikasi bank…'); await open3ds(data.redirect_url); }
+    setBusy(true, 'Mengonfirmasi pembayaran…');
+    if (await waitPaid(data.order_id)) done('/pembayaran/sukses?order_id=' + encodeURIComponent(data.order_id));
+  } catch (err) {
+    toast(err.message || 'Terjadi kesalahan, coba lagi.');
+    setBusy(false);
+  }
+});
+
+$('backBtn').addEventListener('click', () => { if (!busy) location.href = '/premium'; });
+
+/* ---------- Init ---------- */
+(async function init() {
+  try {
+    const me = await fetch('/api/auth/me');
+    if (!me.ok) { location.replace('/'); return; }
+    const [cfgRes, prodRes] = await Promise.all([fetch('/api/payments/config'), fetch('/api/payments/products')]);
+    if (!cfgRes.ok) throw new Error('config');
+    const cfg = await cfgRes.json(), prods = await prodRes.json().catch(() => ({}));
+    amount = Number(prods[product] && prods[product].price) || Number(qs.get('harga')) || 0;
+    $('price').textContent = rupiah(amount);
+    $('priceLabel').textContent = 'Total tagihan · ' + LABEL[product];
+    $('lead').textContent = 'Paket ' + LABEL[product] + '. Masukkan data kartu Visa atau Mastercard kamu.';
+    await loadMidtrans(cfg.client_key, cfg.sandbox);
+    ready = true;
+    setBusy(false);
+  } catch {
+    $('payText').textContent = 'Tidak tersedia';
+    toast('Gagal memuat pembayaran kartu. Muat ulang halaman.');
+  }
+})();
+</script>
+</body>
+</html>

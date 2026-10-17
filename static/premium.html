@@ -2,8 +2,8 @@
 <html lang="id">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pembayaran Premium</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Upgrade Premium</title>
 <style>
   :root {
     --ink: #0f0f12;
@@ -46,7 +46,7 @@
     position: relative; z-index: 30;
     display: flex; align-items: center; justify-content: space-between; gap: 12px;
     width: 100%; max-width: 1120px; margin: 0 auto;
-    padding: 18px 20px 0;
+    padding: calc(18px + env(safe-area-inset-top, 0px)) 20px 0;
   }
   .who { display: flex; align-items: center; gap: 12px; min-width: 0; font-size: 16px; font-weight: 700; }
   .avatar {
@@ -183,6 +183,21 @@
   .method small { display: block; margin-top: 2px; font-size: 12px; color: var(--muted); }
   .method .chev { color: #a3a6ad; flex: none; }
 
+  /* Metode "Segera Hadir" */
+.method .soon {
+  flex: none; white-space: nowrap;
+  font-size: 12px; font-weight: 700; color: #6f7178;
+  background: #e0e2e6; padding: 4px 10px; border-radius: 999px;
+}
+.method .soon[hidden], .method .chev[hidden] { display: none; }
+.method:disabled, .method:disabled:hover {
+  cursor: not-allowed; transform: none; box-shadow: none; color: #8a8d95;
+  background: #eceef1; border-color: #dcdee3;
+  -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+.method:disabled .mi { background: #dfe1e5; color: #9a9da5; }
+.method:disabled small { color: #9a9da5; }
+
   .toast {
     position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 12px); z-index: 50;
     max-width: calc(100% - 40px);
@@ -214,8 +229,90 @@
     .lead { font-size: 16px; }
   }
 
+
+  /* ---------- Badge kuota (sisa lagu) ---------- */
+  .qbadge {
+    display: inline-flex; align-items: center; gap: 4px; flex: none;
+    padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 700; line-height: 1.4; white-space: nowrap;
+    color: #4b3a86;
+    background: rgba(255, 255, 255, .6);
+    border: 1px solid rgba(104, 76, 160, .2);
+    -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  }
+  .qbadge[hidden] { display: none; }
+  .qbadge svg { flex: none; }
+  .qbadge.is-empty { color: #d92d20; background: rgba(217, 45, 32, .08); border-color: rgba(217, 45, 32, .4); }  /* kuota habis */
+
+  /* ---------- Sistem 2 langkah ---------- */
+  .step { display: none; flex-direction: column; gap: 28px; }
+  .step.active { display: flex; flex: 1; }
+
+  .back {
+    display: inline-flex; align-items: center; gap: 6px;
+    align-self: flex-start; margin: -8px 0 -12px -8px; padding: 8px 12px 8px 8px;
+    background: none; border: 0; border-radius: 10px;
+    font: inherit; font-size: 14px; font-weight: 600; color: var(--accent);
+    cursor: pointer;
+  }
+  .back:hover { background: rgba(104, 76, 160, .1); }
+  .back:focus-visible { outline: 2px solid #6c5ce7; outline-offset: 2px; }
+
+  .plans { display: grid; grid-template-columns: 1fr; gap: 14px; }
+  .plan {
+    display: flex; flex-direction: column; gap: 14px; width: 100%;
+    padding: 20px 18px 18px;
+    background: rgba(255, 255, 255, .78);
+    -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+    border: 1px solid rgba(104, 76, 160, .12);
+    border-radius: 18px;
+    box-shadow: 0 6px 20px rgba(40, 20, 80, .07);
+    font: inherit; color: var(--ink); text-align: left; cursor: pointer;
+    transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease, background .15s ease;
+  }
+  .plan:not(:disabled):hover { background: #fff; border-color: rgba(104, 76, 160, .35); box-shadow: 0 10px 26px rgba(40, 20, 80, .12); transform: translateY(-1px); }
+  .plan:not(:disabled):active { transform: scale(.99); }
+  .plan:focus-visible { outline: 2px solid #6c5ce7; outline-offset: 2px; }
+  .plan.featured { border-color: rgba(104, 76, 160, .4); }
+
+  .plan .top { display: flex; align-items: center; gap: 12px; }
+  .plan .mi {
+    width: 44px; height: 44px; flex: none; border-radius: 14px;
+    display: grid; place-items: center;
+    background: rgba(104, 76, 160, .12); color: #4b3a86;
+  }
+  .plan .name { font-size: 17px; font-weight: 800; }
+  .plan .pp { display: flex; align-items: baseline; gap: 8px; }
+  .plan .pp strong { font-size: 26px; font-weight: 800; letter-spacing: -.01em; }
+  .plan .pp small { font-size: 13px; color: var(--muted); }
+  .plan .b { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; line-height: 1.4; color: #34353b; }
+  .plan .b svg { flex: none; margin-top: 2px; color: var(--accent); }
+  .plan .benefits { display: flex; flex-direction: column; gap: 9px; }
+  .plan .cta {
+    margin-top: auto; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    font-size: 14px; font-weight: 700; color: var(--accent);
+  }
+  .plan .note {
+    align-self: flex-start;
+    font-size: 12px; font-weight: 700; color: #6f7178;
+    background: #e0e2e6; padding: 4px 10px; border-radius: 999px;
+  }
+  .plan .note[hidden] { display: none; }
+
+  /* Kartu disabled: abu-abu */
+  .plan:disabled { cursor: not-allowed; background: #eceef1; border-color: #dcdee3; box-shadow: none; color: #8a8d95; -webkit-backdrop-filter: none; backdrop-filter: none; }
+  .plan:disabled .mi { background: #dfe1e5; color: #9a9da5; }
+  .plan:disabled .b, .plan:disabled .pp small, .plan:disabled .cta { color: #9a9da5; }
+  .plan:disabled .b svg { color: #b3b6bd; }
+
+  @media (min-width: 600px) {
+    .step { gap: 32px; }
+    .plans { grid-template-columns: 1fr 1fr; align-items: stretch; }
+    .plan { padding: 22px 20px 20px; }
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    .menu, .scrim, .burger svg line, .toast, .method { transition: none; }
+    .menu, .scrim, .burger svg line, .toast, .method, .plan { transition: none; }
   }
 </style>
 </head>
@@ -227,6 +324,7 @@
     <div class="who">
       <span class="avatar" id="avatar" aria-hidden="true"></span>
       <span class="uname" id="welcome">Welcome</span>
+      <span class="qbadge" id="quotaBadge" hidden title="Sisa kuota unduhan"><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z"/></svg><span class="qtext"></span></span>
     </div>
 
     <button class="burger" id="burger" aria-label="Buka menu" aria-expanded="false" aria-controls="menu">
@@ -263,18 +361,68 @@
   </header>
 
   <main class="content">
-    <section class="intro">
-      <span class="eyebrow">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5L3 8z"/><path d="M5.5 22h13"/></svg>
-        Premium
-      </span>
-      <h1 class="headline">pilih metode pembayaran untuk upgrade premium</h1>
-      <p class="lead">Pilih transfer ke rekening bank atau pembayaran melalui QRIS.</p>
-    </section>
 
-    <section class="pay" aria-labelledby="payTitle">
-      <div class="sec"><h2 id="payTitle">Metode pembayaran</h2><span id="count">3 pilihan</span></div>
-      <div class="list" id="methods">
+    <!-- ===== STEP 1: pilih paket (tampil default) ===== -->
+    <div class="step active" id="step-1-paket">
+      <section class="intro">
+        <span class="eyebrow"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5L3 8z"/><path d="M5.5 22h13"/></svg>
+          Premium
+        </span>
+        <h1 class="headline">pilih paket yang cocok untuk kamu</h1>
+        <p class="lead">Pilih Premium atau Unlimited Pass, lalu lanjut ke pembayaran.</p>
+      </section>
+
+      <section aria-labelledby="planTitle">
+        <div class="sec"><h2 id="planTitle">Pilihan paket</h2><span id="tierInfo">Memuat status akun…</span></div>
+        <div class="plans" id="plans">
+
+          <button class="plan featured" id="plan-premium" data-product="premium" type="button" disabled>
+            <span class="top">
+              <span class="mi"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5L3 8z"/><path d="M5.5 22h13"/></svg></span>
+              <span class="name">Premium</span>
+            </span>
+            <span class="pp"><strong id="price-premium">Rp 89.000</strong><small>sekali bayar</small></span>
+            <span class="benefits">
+            <span class="b"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><span>60 lagu/minggu</span></span>
+            <span class="b"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><span>Bebas iklan</span></span>
+            <span class="b"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><span>Antrean prioritas</span></span>
+            </span>
+            <span class="note" id="note-premium" hidden></span>
+            <span class="cta">Pilih Premium <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></span>
+          </button>
+
+          <button class="plan" id="plan-pass" data-product="pass" type="button" disabled>
+            <span class="top">
+              <span class="mi"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="15" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/></svg></span>
+              <span class="name">Unlimited Pass</span>
+            </span>
+            <span class="pp"><strong id="price-pass">Rp 20.000</strong><small>7 hari</small></span>
+            <span class="benefits">
+            <span class="b"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg><span>300 lagu selama 7 hari</span></span>
+            </span>
+            <span class="note" id="note-pass" hidden></span>
+            <span class="cta">Pilih Unlimited Pass <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></span>
+          </button>
+
+        </div>
+      </section>
+    </div>
+
+    <!-- ===== STEP 2: pembayaran (disembunyikan default) ===== -->
+    <div class="step" id="step-2-pembayaran">
+      <button class="back" id="backBtn" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg> Kembali</button>
+
+      <section class="intro">
+        <span class="eyebrow"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5L3 8z"/><path d="M5.5 22h13"/></svg>
+          Premium
+        </span>
+        <h1 class="headline">pilih metode pembayaran untuk upgrade premium</h1>
+        <p class="lead" id="payLead">Pilih transfer ke rekening bank atau pembayaran melalui QRIS.</p>
+      </section>
+
+      <section class="pay" aria-labelledby="payTitle">
+        <div class="sec"><h2 id="payTitle">Metode pembayaran</h2><span id="count">3 pilihan</span></div>
+        <div class="list" id="methods">
         <button class="method" data-method="Transfer Bank">
           <span class="mi"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9.5L12 4l9 5.5H3z"/><path d="M5 12v6M9.5 12v6M14.5 12v6M19 12v6"/><path d="M3 20.5h18"/></svg></span>
           <span class="mt"><strong>Transfer Bank</strong><small>BCA, Mandiri, BNI, BRI</small></span>
@@ -290,15 +438,37 @@
           <span class="mt"><strong>E-Wallet</strong><small>GoPay, ShopeePay, Dana</small></span>
           <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
         </button>
-      </div>
-    </section>
+        <button class="method" data-method="Kartu Kredit" type="button">
+  <span class="mi"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 10h18M7 15h3"/></svg></span>
+  <span class="mt"><strong>Kartu Kredit / Debit</strong><small>Visa, Mastercard, JCB</small></span>
+  <span class="soon" hidden>Segera Hadir</span>
+  <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+</button>
 
-    <aside class="summary" aria-label="Total tagihan">
+<button class="method" data-method="PayPal" type="button">
+  <span class="mi"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 3.5 5.5 3.5 9S14.500 18.500 12 21c-2.500-2.500-3.500-5.500-3.500-9S9.500 5.500 12 3z"/></svg></span>
+  <span class="mt"><strong>PayPal</strong><small>Pembayaran global via PayPal</small></span>
+  <span class="soon" hidden>Segera Hadir</span>
+  <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+</button>
+
+<button class="method" data-method="Stripe" type="button">
+  <span class="mi"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 3v6c0 4.500-3.200 7.800-8 9-4.800-1.200-8-4.500-8-9V6l8-3z"/><path d="M8.500 12l2.500 2.500 4.500-5"/></svg></span>
+  <span class="mt"><strong>Stripe</strong><small>Pembayaran aman via Stripe</small></span>
+  <span class="soon" hidden>Segera Hadir</span>
+  <svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+</button>
+      </div>
+      </section>
+
+      <aside class="summary" aria-label="Total tagihan">
       <div class="price">
-        <span>Total tagihan</span>
+        <span id="priceLabel">Total tagihan</span>
         <strong id="price">Rp 100.000</strong>
       </div>
     </aside>
+    </div>
+
   </main>
 </div>
 
@@ -330,10 +500,146 @@ function renderUser(u) {
   }
 }
 
-fetch('/api/auth/me')
-  .then(r => { if (!r.ok) throw new Error('belum login'); return r.json(); })
-  .then(renderUser)
-  .catch(() => location.replace('/'));
+/* ---------- Badge kuota: GET /api/quota -> {"tier":"free","limit":30,"remaining":14} ---------- */
+function renderQuotaBadge(q) {
+  const el = document.getElementById('quotaBadge');
+  if (!el) return;
+  const n = q && typeof q.remaining === 'number' ? q.remaining : null;
+  const unlimited = !!(q && q.unlimited) || (n !== null && n < 0);
+  if (n === null && !unlimited) { el.hidden = true; return; }
+  const empty = !unlimited && n === 0;
+  el.querySelector('.qtext').textContent = unlimited ? 'Unlimited' : n.toLocaleString('id-ID') + ' Lagu';
+  el.classList.toggle('is-empty', empty);
+  el.title = empty ? 'Kuota unduhan habis'
+    : unlimited ? 'Unduhan tanpa batas'
+    : 'Sisa kuota unduhan' + (q && typeof q.limit === 'number' ? ' (dari ' + q.limit + ' lagu)' : '');
+  el.hidden = false;
+}
+
+/* ---------- State, step & status akun ----------
+   GET /api/quota -> {"tier":"free","prices":{"premium":89000,"pass":20000}}
+   tier "free" => Unlimited Pass disabled ("Khusus member Premium") */
+let selectedProduct = null;                       // 'premium' | 'pass'
+const prices = { premium: 89000, pass: 20000 };
+const LABEL = { premium: 'Premium', pass: 'Unlimited Pass' };
+const TIER_LABEL = { free: 'Free', premium: 'Premium', pass: 'Premium + Pass' };
+const rupiah = n => new Intl.NumberFormat('id-ID', {
+  style: 'currency', currency: 'IDR', maximumFractionDigits: 0
+}).format(n);
+
+const step1 = $('step-1-paket'), step2 = $('step-2-pembayaran');
+const cards = {
+  premium: { btn: $('plan-premium'), note: $('note-premium'), price: $('price-premium') },
+  pass:    { btn: $('plan-pass'),    note: $('note-pass'),    price: $('price-pass') }
+};
+
+function showStep(n) {
+  step1.classList.toggle('active', n === 1);
+  step2.classList.toggle('active', n === 2);
+  window.scrollTo(0, 0);
+  if (n === 2) $('backBtn').focus({ preventScroll: true });
+}
+
+function setLocked(key, locked, note) {
+  const c = cards[key];
+  c.btn.disabled = locked;
+  c.note.textContent = locked ? (note || '') : '';
+  c.note.hidden = !(locked && note);
+}
+
+function renderPrices(p) {
+  ['premium', 'pass'].forEach(k => {
+    const v = Number(p && p[k]);
+    if (Number.isFinite(v) && v > 0) prices[k] = v;
+    cards[k].price.textContent = rupiah(prices[k]);
+  });
+}
+
+function applyTier(tier) {
+  $('tierInfo').textContent = 'Paket kamu: ' + (TIER_LABEL[tier] || tier);
+  if (tier === 'free') {
+    setLocked('premium', false);
+    setLocked('pass', true, 'Khusus member Premium');          // Free: Pass disabled
+  } else {
+    setLocked('premium', true, 'Akun kamu sudah Premium');     // jangan beli seumur hidup dua kali
+    setLocked('pass', false);
+  }
+}
+
+// Sebelum data kuota tiba, kedua kartu terkunci
+setLocked('premium', true);
+setLocked('pass', true, 'Khusus member Premium');
+renderPrices(prices);
+
+async function initAccount() {
+  let user;
+  try {
+    const r = await fetch('/api/auth/me');
+    if (!r.ok) throw new Error('belum login');
+    user = await r.json();
+  } catch {
+    location.replace('/');
+    return;
+  }
+  renderUser(user);
+
+  try {
+    const r = await fetch('/api/quota');
+    if (r.status === 401) { location.replace('/'); return; }
+    if (!r.ok) throw new Error('quota ' + r.status);
+    const q = await r.json();
+    renderQuotaBadge(q);
+    renderPrices(q.prices);
+    applyTier(String(q.tier || 'free').toLowerCase());
+  } catch {
+    // Status tidak diketahui: Premium tetap bisa dipilih, Pass tetap terkunci
+    $('tierInfo').textContent = 'Gagal memuat status akun';
+    setLocked('premium', false);
+    toast('Gagal memuat status akun. Muat ulang halaman ya.');
+  }
+}
+initAccount();
+
+/* ---------- Step 1 -> Step 2: simpan pilihan produk ---------- */
+function selectProduct(key) {
+  selectedProduct = key;
+  $('price').textContent = rupiah(prices[key]);
+  $('priceLabel').textContent = 'Total tagihan · ' + LABEL[key];
+  $('payLead').textContent = 'Paket ' + LABEL[key] + '. Pilih metode pembayaran yang kamu inginkan.';
+  showStep(2);
+}
+$('plans').addEventListener('click', e => {
+  const btn = e.target.closest('[data-product]');
+  if (!btn || btn.disabled) return;
+  selectProduct(btn.dataset.product);
+});
+
+/* ---------- Kembali: batalkan, balik ke Step 1 ---------- */
+$('backBtn').addEventListener('click', () => {
+  selectedProduct = null;
+  showStep(1);
+});
+
+/* ---------- Toggle status metode: 'active' | 'soon' ----------
+   Ubah 'soon' menjadi 'active' untuk mengaktifkan sebuah metode.
+   Metode yang tidak ada di sini (Transfer Bank, QRIS, E-Wallet) tidak disentuh. */
+const METHOD_STATUS = {
+  'Kartu Kredit': 'active',
+  'PayPal':       'active',
+  'Stripe':       'active'
+};
+function applyMethodStatus() {
+  document.querySelectorAll('.method[data-method]').forEach(btn => {
+    const status = METHOD_STATUS[btn.dataset.method];
+    if (!status) return;
+    const soon = status === 'soon';
+    btn.disabled = soon;
+    const badge = btn.querySelector('.soon'), chev = btn.querySelector('.chev');
+    if (badge) badge.hidden = !soon;
+    if (chev) chev.hidden = soon;
+  });
+}
+applyMethodStatus();
 
 /* ---------- Jumlah pilihan mengikuti jumlah baris ---------- */
 $('count').textContent = document.querySelectorAll('.method').length + ' pilihan';
@@ -370,26 +676,74 @@ function toast(msg) {
   toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
 }
 
-/* ---------- Harga mengikuti paket yang dipilih user (dikirim lewat ?harga=) ---------- */
-const hargaParam = parseInt(new URLSearchParams(location.search).get('harga'), 10);
-const harga = hargaParam > 0 ? hargaParam : 100000;
-$('price').textContent = new Intl.NumberFormat('id-ID', {
-  style: 'currency', currency: 'IDR', maximumFractionDigits: 0
-}).format(harga);
+/* ---------- Bayar via QRIS (Step 2) ----------
+   premium: POST /api/payments/qris
+   pass:    POST /api/payments/qris?product=pass */
+let paying = false;
+async function payQris() {
+  if (paying || !selectedProduct) return;
+  paying = true;
+  const product = selectedProduct;
+  try {
+    const res = await fetch('/api/payments/qris' + (product === 'pass' ? '?product=pass' : ''), { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) { location.replace('/'); return; }
+    if (!res.ok) {
+      toast(data.message || data.error || 'Gagal membuat pembayaran QRIS (' + res.status + ')');
+      return;
+    }
+    // Simpan respons supaya halaman QRIS bisa menampilkannya tanpa membuat tagihan baru
+    try { sessionStorage.setItem('qris_payment', JSON.stringify({ product, ...data })); } catch {}
+    location.href = '/premium/qris' + (product === 'pass' ? '?product=pass' : '');
+  } catch {
+    toast('Koneksi bermasalah, coba lagi.');
+  } finally {
+    paying = false;
+  }
+}
 
-/* ---------- Pilihan metode pembayaran (belum tersambung ke payment gateway) ---------- */
+/* ---------- PayPal / Stripe: backend mengembalikan {redirect_url} ---------- */
+async function payRedirect(endpoint) {
+  if (paying || !selectedProduct) return;
+  paying = true;
+  try {
+    const res = await fetch('/api/payments/' + endpoint + '?product=' + encodeURIComponent(selectedProduct), { method: 'POST' });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) { location.replace('/'); return; }
+    if (!res.ok) { toast(data.detail || data.message || 'Gagal membuat pembayaran (' + res.status + ')'); return; }
+    if (data.redirect_url) location.href = data.redirect_url;
+    else toast('Respons pembayaran tidak valid.');
+  } catch {
+    toast('Koneksi bermasalah, coba lagi.');
+  } finally {
+    paying = false;
+  }
+}
+
+/* ---------- Pilihan metode pembayaran ---------- */
 $('methods').addEventListener('click', e => {
   const btn = e.target.closest('[data-method]');
-  if (!btn) return;
-    if (btn.dataset.method === 'Transfer Bank') {
-    location.href = '/premium/transfer-bank?harga=' + encodeURIComponent(harga);
+  if (!btn || btn.disabled) return;
+  if (!selectedProduct) { showStep(1); return; }
+  if (btn.dataset.method === 'QRIS') { payQris(); return; }
+  if (btn.dataset.method === 'Transfer Bank') {
+    location.href = '/premium/transfer-bank?product=' + encodeURIComponent(selectedProduct)
+      + '&harga=' + encodeURIComponent(prices[selectedProduct]);
     return;
   }
-  if (btn.dataset.method === 'QRIS') {
-    location.href = '/premium/qris';
+  if (btn.dataset.method === 'PayPal') { payRedirect('paypal'); return; }
+  if (btn.dataset.method === 'Stripe') { payRedirect('stripe'); return; }
+  if (btn.dataset.method === 'Kartu Kredit') {
+    location.href = '/premium/kartu?product=' + encodeURIComponent(selectedProduct)
+      + '&harga=' + encodeURIComponent(prices[selectedProduct]);
     return;
   }
   toast(btn.dataset.method + ' segera tersedia');
+});
+
+/* Kembali dari halaman QRIS lewat tombol back browser: mulai lagi dari Step 1 */
+window.addEventListener('pageshow', e => {
+  if (e.persisted) { paying = false; selectedProduct = null; showStep(1); }
 });
 </script>
 </body>

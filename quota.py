@@ -4,7 +4,8 @@ Logika kuota unduhan.
 Aturan:
   free    : 30 lagu SEUMUR HIDUP (tidak pernah reset)
   premium : 60 lagu / minggu, reset Senin 09.00 WIB
-  pass    : Unlimited Pass (hanya Premium), 7 hari sejak dibeli, batas wajar 300 lagu
+  pass    : Unlimited Pass (hanya Premium), aktif 7 hari sejak dibeli,
+            60 lagu, reset tiap Senin 09.00 WIB selama Pass aktif
   - Yang dihitung hanya lagu yang BERHASIL diunduh.
   - Lagu yang sama diunduh ulang dalam 24 jam tidak memotong kuota.
   - Album lebih besar dari sisa kuota: hanya sebagian (urut dari lagu pertama) yang diunduh.
@@ -23,7 +24,7 @@ WIB = timezone(timedelta(hours=7))
 
 FREE_LIMIT = int(os.getenv("FREE_LIMIT", "30"))
 PREMIUM_WEEKLY_LIMIT = int(os.getenv("PREMIUM_WEEKLY_LIMIT", "60"))
-PASS_LIMIT = int(os.getenv("PASS_LIMIT", "300"))
+PASS_LIMIT = int(os.getenv("PASS_LIMIT", "60"))
 REDOWNLOAD_WINDOW = 24 * 3600
 RESERVATION_TTL = 2 * 3600  # pengaman kalau server mati di tengah unduhan
 
@@ -66,7 +67,9 @@ def _status(conn, user_id: str, now: int) -> dict:
         ).fetchone()
 
     if pass_row:
-        tier, limit, since, resets_at = "pass", PASS_LIMIT, pass_row["starts_at"], pass_row["ends_at"]
+        since = max(pass_row["starts_at"], week_start(now))
+        tier, limit = "pass", PASS_LIMIT
+        resets_at = min(next_reset(now), pass_row["ends_at"])
     elif premium:
         since = week_start(now)
         tier, limit, resets_at = "premium", PREMIUM_WEEKLY_LIMIT, since + 7 * 86400
