@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memproses pembayaran</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { min-height: 100dvh; display: grid; place-items: center; padding: 24px; font-family: "Inter", system-ui, sans-serif; background: #e9eaee; color: #0f0f12; }
+  .card { width: 100%; max-width: 420px; padding: 32px 24px; text-align: center; background: #fff; border-radius: 18px; box-shadow: 0 8px 30px rgba(20,20,40,.12); }
+  .spin { width: 40px; height: 40px; margin: 0 auto 16px; border: 4px solid #e0daf0; border-top-color: #684ca0; border-radius: 50%; animation: sp .8s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+  h1 { font-size: 20px; margin-bottom: 8px; }
+  p { font-size: 14px; line-height: 1.5; color: #3f4047; }
+  a { display: none; margin-top: 20px; padding: 14px; border-radius: 14px; background: #684ca0; color: #fff; font-weight: 700; text-decoration: none; }
+  .fail .spin { display: none; }
+  .fail a { display: block; }
+  @media (prefers-reduced-motion: reduce) { .spin { animation-duration: 3s; } }
+</style>
+</head>
+<body>
+<main class="card" id="card">
+  <div class="spin"></div>
+  <h1 id="title">Memproses pembayaran…</h1>
+  <p id="msg">Jangan tutup halaman ini.</p>
+  <a href="/premium">Kembali ke halaman Premium</a>
+</main>
+<script>
+const q = new URLSearchParams(location.search);
+const orderId = q.get('order_id') || '';
+const provider = q.get('provider') || '';
+const enc = encodeURIComponent;
+
+function fail(text) {
+  document.getElementById('card').classList.add('fail');
+  document.getElementById('title').textContent = 'Pembayaran belum berhasil';
+  document.getElementById('msg').textContent = text;
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function run() {
+  if (!orderId || !['stripe', 'paypal'].includes(provider)) return fail('Data pembayaran tidak lengkap.');
+  try {
+    if (provider === 'paypal') {
+      const token = q.get('token') || '';
+      const r = await fetch('/api/payments/paypal/capture?order_id=' + enc(orderId) + '&token=' + enc(token), { method: 'POST' });
+      if (r.status === 401) return location.replace('/');
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) return fail(d.detail || 'Gagal mengonfirmasi pembayaran PayPal.');
+      if (d.status === 'paid') return location.replace('/pembayaran/sukses?order_id=' + enc(orderId));
+      if (d.status === 'failed') return fail('Pembayaran PayPal ditolak atau dibatalkan.');
+      // 'pending': lanjut cek status di bawah
+    }
+    const sid = q.get('session_id') || '';
+    for (let i = 0; i < 30; i++) {
+      const r = await fetch('/api/payments/status/' + enc(orderId) + (sid ? '?session_id=' + enc(sid) : ''));
+      if (r.status === 401) return location.replace('/');
+      const d = await r.json().catch(() => ({}));
+      if (d.status === 'paid') return location.replace('/pembayaran/sukses?order_id=' + enc(orderId));
+      if (d.status === 'failed' || d.status === 'expired') return fail('Pembayaran gagal atau kedaluwarsa. Coba lagi.');
+      await sleep(2000);
+    }
+    fail('Pembayaran belum terkonfirmasi. Jika saldo terpotong, cek lagi dalam beberapa menit.');
+  } catch {
+    fail('Koneksi bermasalah. Muat ulang halaman ini.');
+  }
+}
+run();
+</script>
+</body>
+</html>

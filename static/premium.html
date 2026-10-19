@@ -3,13 +3,14 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link href="https://fonts.googleapis.com/css2?family=Gilda+Display&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <title>Upgrade Premium</title>
 <style>
   :root {
     --ink: #0f0f12;
     --muted: #6f7178;
     --field: #f1f2f4;
-    --accent: #684ca0;          /* ungu senada cover album */
+    --accent: #684ca0;
     --gold: #e39a12;
   }
   * { box-sizing: border-box; margin: 0; }
@@ -314,6 +315,58 @@
   @media (prefers-reduced-motion: reduce) {
     .menu, .scrim, .burger svg line, .toast, .method, .plan { transition: none; }
   }
+
+  /* ===== Premium: mengikuti tema Reloopa ===== */
+:root { --display: "Gilda Display", "Cabin", serif; --mono: "JetBrains Mono", ui-monospace, monospace; --accent: #0f0f12; }
+
+/* cat air lebih lembut supaya teks terbaca */
+.bg { opacity: .28; }
+
+/* header */
+.uname { font-family: var(--display); font-weight: 400; font-size: 17px; }
+.qbadge { font-family: var(--mono); font-weight: 500; color: var(--ink); border-color: rgba(15,15,18,.3); }
+
+/* judul */
+.eyebrow { font-family: var(--mono); font-weight: 500; color: var(--ink); letter-spacing: .08em; }
+.headline {
+  font-family: var(--display); font-weight: 400; letter-spacing: 0; line-height: 1.04;
+  font-size: clamp(36px, 4.6vw, 60px); max-width: 12em;
+  -webkit-text-stroke: .5px currentColor;
+}
+.lead { color: #55565d; }
+.sec h2 { font-family: var(--display); font-weight: 400; font-size: 24px; }
+.sec span { font-family: var(--mono); font-size: 12px; }
+
+/* kartu paket & metode: kaca bening, bingkai tipis */
+.plan, .method {
+  background: rgba(255,255,255,.82);
+  border: 1px solid rgba(15,15,18,.18);
+  border-radius: 24px;
+  box-shadow: 0 16px 40px rgba(30,10,50,.10);
+}
+.plan:not(:disabled):hover, .method:not(:disabled):hover { border-color: rgba(15,15,18,.45); background: #fff; }
+.plan.featured { border-color: rgba(15,15,18,.4); }
+
+/* ikon: lingkaran bening seperti tombol pensil */
+.plan .mi, .method .mi {
+  border-radius: 50%; color: var(--ink);
+  background: rgba(255,255,255,.7); border: 1px solid rgba(15,15,18,.25);
+}
+.plan .name { font-family: var(--display); font-weight: 400; font-size: 24px; }
+.plan .pp strong, .price strong { font-family: var(--display); font-weight: 400; font-size: 34px; letter-spacing: 0; }
+.plan .pp small { font-family: var(--mono); font-size: 12px; }
+.plan .b svg { color: var(--ink); }
+.plan .cta { color: var(--ink); font-family: var(--mono); font-weight: 500; font-size: 13px; }
+.plan .note { font-family: var(--mono); font-weight: 500; background: rgba(15,15,18,.08); }
+
+/* tombol kembali & fokus netral */
+.back { color: var(--ink); font-family: var(--mono); font-weight: 500; }
+.back:hover { background: rgba(15,15,18,.06); }
+.burger:focus-visible, .back:focus-visible, .plan:focus-visible, .method:focus-visible, .menu-item:focus-visible { outline-color: var(--ink); }
+
+/* total tagihan */
+.price { border: 1px solid rgba(15,15,18,.18); border-radius: 24px; background: rgba(255,255,255,.85); }
+.price span { font-family: var(--mono); font-size: 12px; color: #55565d; }
 </style>
 </head>
 <body>

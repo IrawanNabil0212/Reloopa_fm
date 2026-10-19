@@ -1,13 +1,19 @@
 """
 Spotify Album Downloader & Zipper - FastAPI backend (dengan fitur Premium).
+Versi dioptimasi: metadata via scraping halaman publik Spotify, unduhan yt-dlp paralel,
+cache audio, ZIP tanpa kompresi. Tanpa spotdl, tanpa spotipy, tanpa kredensial Spotify.
 
 Jalankan:
     uvicorn main:app --host 0.0.0.0 --port 8000
 
 Variabel lingkungan (opsional):
-    SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET  -> kredensial Spotify milikmu sendiri
+    AUDIO_BITRATE                              -> kbps hasil konversi (default 192)
+    TRACK_TIMEOUT                              -> batas waktu unduh per lagu (default 180 detik)
+    YTDLP_JS_RUNTIME                           -> runtime JS untuk yt-dlp, mis. "node" (default: deno otomatis)
     AUDIO_FORMAT                               -> mp3 (default), flac, ogg, opus, m4a, wav
     MAX_CONCURRENT_JOBS                        -> jumlah job paralel (default 2)
+    DOWNLOAD_THREADS                           -> lagu yang diunduh bersamaan (default 4)
+    CACHE_MAX_GB                               -> batas ukuran cache_audio/ (default 5, 0 = tanpa batas)
     ZIP_TTL_FREE / ZIP_TTL_PREMIUM             -> umur file zip (default 600 / 3600 detik)
     GOOGLE_CLIENT_ID, SESSION_SECRET           -> login Google & cookie sesi
     MIDTRANS_SERVER_KEY, MIDTRANS_CLIENT_KEY   -> pembayaran (lihat payments.py)
@@ -24,12 +30,18 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv()  # harus sebelum membaca os.getenv di bawah
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -39,19 +51,20 @@ from google.auth.exceptions import TransportError
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 from pydantic import BaseModel
+import requests
+import yt_dlp
+from bs4 import BeautifulSoup
+from mutagen import File as MutagenFile
+from mutagen.id3 import APIC, ID3
 from requests.exceptions import RequestException
-from spotdl import Spotdl
 from starlette.middleware.sessions import SessionMiddleware
-
-from dotenv import load_dotenv
-load_dotenv()
 
 import db
 import quota
-import cover  # <- custom cover (Premium)
+import cover  # <- custom cover (Premium), penyematan via mutagen
 from db import init_db, is_premium, upsert_user
 from ratelimit import RateLimiter, client_ip
-from payments import router as payments_router, pages_router
+from payments import router as payments_router
 
 
 # --------------------------------------------------------------------------- #
@@ -60,21 +73,30 @@ from payments import router as payments_router, pages_router
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 ZIPS_DIR = BASE_DIR / "zips"
+CACHE_DIR = BASE_DIR / "cache_audio"  # cache lagu hasil unduhan (permanen, dibatasi ukuran)
 STATIC_DIR = BASE_DIR / "static"  # berisi index.html (frontend)
 
 ZIP_TTL_FREE = int(os.getenv("ZIP_TTL_FREE", "600"))        # 10 menit
 ZIP_TTL_PREMIUM = int(os.getenv("ZIP_TTL_PREMIUM", "3600"))  # 1 jam
 MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
 AUDIO_FORMAT = os.getenv("AUDIO_FORMAT", "mp3")
+DOWNLOAD_THREADS = max(1, int(os.getenv("DOWNLOAD_THREADS", "4")))
+CACHE_MAX_BYTES = int(float(os.getenv("CACHE_MAX_GB", "5")) * 1024**3)
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "dev-only-ganti-di-production")
 
-# Kredensial default bawaan spotdl (dipakai bersama banyak orang, mudah kena
-# rate limit). Sebaiknya ganti dengan kredensial dari developer.spotify.com.
-SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "5f573c9620494bae87890c0f08a60293")
-SPOTIFY_CLIENT_SECRET = os.getenv(
-    "SPOTIFY_CLIENT_SECRET", "212476d9b0f3472eaa762d90b19b0ba8"
-)
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "192")  # kbps untuk mp3/m4a/ogg/opus
+TRACK_TIMEOUT = int(os.getenv("TRACK_TIMEOUT", "180"))  # batas waktu unduh per lagu (detik)
+YTDLP_JS_RUNTIME = os.getenv("YTDLP_JS_RUNTIME", "")  # kosong = otomatis (deno); atau "node"
+
+# Header untuk mengambil halaman publik Spotify (bahasa Inggris supaya <title> konsisten)
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 # Tipe link yang diizinkan. Hapus "playlist"/"track" jika hanya ingin album.
 SPOTIFY_URL_RE = re.compile(
@@ -82,6 +104,7 @@ SPOTIFY_URL_RE = re.compile(
     r"(?P<kind>album|playlist|track)/(?P<id>[A-Za-z0-9]{22})(?:\?.*)?$"
 )
 SESSION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+TRACK_ID_RE = re.compile(r"^[A-Za-z0-9]{22}$")
 
 TERMINAL_STATUSES = {"done", "error"}
 
@@ -120,31 +143,388 @@ class DownloadError(Exception):
     """Error yang pesannya aman ditampilkan ke user."""
 
 
-# Satu thread khusus untuk semua pekerjaan spotdl (instance spotdl hanya boleh satu)
-SPOTDL_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="spotdl")
-_spotdl_client: Spotdl | None = None
+# --------------------------------------------------------------------------- #
+# Pengunduh audio: yt-dlp (cari di YouTube -> unduh -> konversi dengan ffmpeg)
+# --------------------------------------------------------------------------- #
+# Pool global: batas total unduhan yang berjalan bersamaan di SEMUA job.
+DL_POOL = ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS, thread_name_prefix="ytdlp")
+_PP_CODEC = {"ogg": "vorbis"}  # nama codec yt-dlp bila berbeda dari ekstensi
+_NAME_LOCK = threading.Lock()
 
 
-def get_spotdl() -> Spotdl:
-    """Dibuat sekali, dan hanya boleh dipanggil dari thread SPOTDL_EXECUTOR."""
-    global _spotdl_client
-    if _spotdl_client is None:
-        _spotdl_client = Spotdl(
-            client_id=SPOTIFY_CLIENT_ID,
-            client_secret=SPOTIFY_CLIENT_SECRET,
-            downloader_settings={
-                "output": str(DOWNLOADS_DIR / "_tmp" / "{artists} - {title}.{output-ext}"),
-                "format": AUDIO_FORMAT,
-                "threads": 1,
-            },
+def _ffmpeg_location() -> str | None:
+    if shutil.which("ffmpeg"):
+        return None  # yt-dlp akan menemukannya sendiri di PATH
+    try:  # pakai ffmpeg yang dulu diunduh spotdl (kalau masih ada)
+        from spotdl.utils.ffmpeg import get_local_ffmpeg
+
+        path = get_local_ffmpeg()
+        return str(path) if path else None
+    except Exception:
+        return None
+
+
+FFMPEG_LOCATION = _ffmpeg_location()
+
+
+def _search_query(meta: dict) -> str:
+    artists = ", ".join(meta.get("artists") or [])
+    name = meta.get("name") or ""
+    return f"{artists} - {name}" if artists else name
+
+
+def _download_one(track_id: str, meta: dict, work_dir: Path) -> Path:
+    """Blocking: cari di YouTube lalu unduh + konversi. Mengembalikan path file hasil."""
+    query = _search_query(meta).strip()
+    if not query:
+        raise FileNotFoundError("nama lagu kosong")
+
+    # Filter durasi supaya tidak terambil mix/live/video panjang (penyebab unduhan "macet").
+    dur = int(meta.get("duration") or 0)
+    if dur > 0:
+        flt = f"duration >= {max(30, int(dur * 0.7))} & duration <= {dur + 90} & !is_live"
+    else:
+        flt = "duration <= 900 & !is_live"
+
+    deadline = time.monotonic() + TRACK_TIMEOUT
+
+    def _hook(_d) -> None:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"unduhan melebihi {TRACK_TIMEOUT} detik")
+
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(work_dir / f"{track_id}.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 15,
+        "retries": 3,
+        "fragment_retries": 3,
+        "concurrent_fragment_downloads": 4,
+        "match_filter": yt_dlp.utils.match_filter_func(flt),
+        "max_downloads": 1,                  # berhenti setelah satu kandidat berhasil
+        "max_filesize": 50 * 1024 * 1024,    # tolak file raksasa
+        "progress_hooks": [_hook],
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": _PP_CODEC.get(AUDIO_FORMAT, AUDIO_FORMAT),
+                "preferredquality": AUDIO_BITRATE,
+            }
+        ],
+    }
+    if FFMPEG_LOCATION:
+        opts["ffmpeg_location"] = FFMPEG_LOCATION
+    if YTDLP_JS_RUNTIME:
+        opts["js_runtimes"] = {YTDLP_JS_RUNTIME: {}}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([f"ytsearch5:{query}"])  # 5 kandidat, yang lolos filter pertama diambil
+    except yt_dlp.utils.DownloadCancelled:  # termasuk MaxDownloadsReached (normal)
+        pass
+    for f in work_dir.glob(f"{track_id}.*"):
+        if f.suffix.lower() == f".{AUDIO_FORMAT}":
+            return f
+    raise FileNotFoundError(f"tidak ada hasil yang cocok: {query}")
+
+
+def _fetch_cover(url: str | None) -> bytes | None:
+    if not url:
+        return None
+    try:
+        resp = _http.get(url, headers=HTTP_HEADERS, timeout=8)
+        resp.raise_for_status()
+        return resp.content if len(resp.content) < 5 * 1024 * 1024 else None
+    except Exception as exc:
+        log.warning("Gagal mengambil cover album: %r", exc)
+        return None
+
+
+def _tag_mp3(path: Path, meta: dict, album: dict, cover_art: bytes | None) -> None:
+    """Tulis tag ID3 (judul, artis, album, cover bawaan) dengan mutagen. Hanya untuk MP3."""
+    try:
+        audio = MutagenFile(str(path), easy=True)
+        if audio is None:
+            return
+        if audio.tags is None:
+            audio.add_tags()
+        audio["title"] = [meta.get("name") or path.stem]
+        if meta.get("artists"):
+            audio["artist"] = [", ".join(meta["artists"])]
+        if album.get("kind") == "album" and album.get("title"):
+            audio["album"] = [album["title"]]
+            if album.get("artist"):
+                audio["albumartist"] = [album["artist"]]
+            if album.get("year"):
+                audio["date"] = [str(album["year"])]
+        audio.save()
+        if cover_art:
+            id3 = ID3(str(path))
+            id3.delall("APIC")
+            mime = "image/png" if cover_art[:4] == b"\x89PNG" else "image/jpeg"
+            id3.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=cover_art))
+            id3.save(v2_version=3)
+    except Exception as exc:
+        log.warning("Gagal menulis tag untuk %s: %r", path.name, exc)
+
+
+def _process_track(
+    track_id: str, meta: dict, album: dict, cover_art: bytes | None, work_dir: Path, out_dir: Path
+) -> None:
+    """Berjalan di DL_POOL: unduh -> tag -> simpan ke cache -> pindah ke folder sesi."""
+    t0 = time.perf_counter()
+    path = _download_one(track_id, meta, work_dir)
+    log.info("yt-dlp selesai %.1f detik: %s", time.perf_counter() - t0, _search_query(meta))
+    if AUDIO_FORMAT == "mp3":
+        _tag_mp3(path, meta, album, cover_art)
+    cache_put(track_id, path)  # salinan asli (tanpa custom cover)
+    artists = ", ".join(meta.get("artists") or [])
+    stem = safe_filename(f"{artists} - {meta.get('name')}" if artists else (meta.get("name") or track_id))
+    with _NAME_LOCK:
+        dest = unique_path(out_dir, stem, path.suffix.lstrip("."), track_id)
+        shutil.move(str(path), str(dest))
+
+
+# --------------------------------------------------------------------------- #
+# Metadata: scraping halaman publik Spotify (tanpa API, tanpa kredensial)
+#   1. halaman embed  -> JSON <script id="__NEXT_DATA__"> (judul, artis, daftar lagu, cover)
+#   2. fallback       -> tag OpenGraph halaman biasa (+ satu request per lagu untuk album/playlist)
+# Struktur halaman ini TIDAK resmi dan bisa berubah kapan saja.
+# --------------------------------------------------------------------------- #
+META_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="scrape")
+_http = requests.Session()
+_TRACK_URI_RE = re.compile(r"^spotify:track:([A-Za-z0-9]{22})$")
+_TRACK_URL_RE = re.compile(r"/track/([A-Za-z0-9]{22})")
+
+
+def _http_get(url: str) -> str:
+    resp = _http.get(url, headers=HTTP_HEADERS, timeout=6)
+    resp.raise_for_status()
+    return resp.text
+
+
+def _split_artists(text: str | None) -> list[str]:
+    return [a.strip() for a in re.split(r",[\s\u00a0]*", text or "") if a.strip()]
+
+
+def _largest_image(sources) -> str | None:
+    best = None
+    for src in sources or []:
+        if isinstance(src, dict) and src.get("url"):
+            if best is None or (src.get("width") or 0) > (best.get("width") or 0):
+                best = src
+    return best["url"] if best else None
+
+
+def _find_entity(obj, kind: str, sid: str) -> dict | None:
+    """Cari objek entity (uri == spotify:<kind>:<id>) di dalam JSON __NEXT_DATA__."""
+    want = f"spotify:{kind}:{sid}"
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            if cur.get("uri") == want and (cur.get("name") or cur.get("title")):
+                return cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return None
+
+
+def parse_embed_entity(entity: dict, kind: str, sid: str) -> dict:
+    title = entity.get("name") or entity.get("title")
+    artists_field = entity.get("artists")
+    if isinstance(artists_field, list):
+        artist_list = [a.get("name") for a in artists_field if isinstance(a, dict) and a.get("name")]
+    else:
+        artist_list = _split_artists(entity.get("subtitle"))
+    release = entity.get("releaseDate")
+    iso = release.get("isoString") if isinstance(release, dict) else None
+    cover = (
+        _largest_image((entity.get("coverArt") or {}).get("sources"))
+        or _largest_image((entity.get("visualIdentity") or {}).get("image"))
+    )
+    tracks: list[dict] = []
+    if kind == "track":
+        tracks.append(
+            {"id": sid, "name": title or "", "artists": artist_list, "duration": (entity.get("duration") or 0) // 1000}
         )
-    return _spotdl_client
+    else:
+        for item in entity.get("trackList") or []:
+            m = _TRACK_URI_RE.match(str(item.get("uri") or ""))
+            if m:
+                tracks.append(
+                    {
+                        "id": m.group(1),
+                        "name": item.get("title") or "",
+                        "artists": _split_artists(item.get("subtitle")),
+                        "duration": (item.get("duration") or 0) // 1000,
+                    }
+                )
+    return {
+        "kind": kind,
+        "title": title,
+        "artist": ", ".join(artist_list) or None,
+        "year": int(iso[:4]) if iso and iso[:4].isdigit() else None,
+        "cover_url": cover,
+        "tracks": tracks,
+        "source": "embed",
+    }
+
+
+def parse_open_graph(html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+
+    def meta(key: str) -> str | None:
+        tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
+        return tag.get("content") if tag and tag.get("content") else None
+
+    page_title = soup.title.get_text() if soup.title else ""
+    m = re.search(r" by (.+?) \| Spotify", page_title)  # "X - song and lyrics by Y | Spotify"
+    track_ids = []
+    for tag in soup.find_all("meta", attrs={"name": "music:song"}) + soup.find_all("meta", attrs={"property": "music:song"}):
+        mm = _TRACK_URL_RE.search(tag.get("content") or "")
+        if mm and mm.group(1) not in track_ids:
+            track_ids.append(mm.group(1))
+    return {
+        "title": meta("og:title"),
+        "artist": m.group(1).strip() if m else None,
+        "cover_url": meta("og:image"),
+        "track_ids": track_ids,
+    }
+
+
+def _scrape_sync(kind: str, sid: str) -> dict:
+    """Blocking: coba halaman embed dulu, lalu fallback OpenGraph."""
+    try:
+        html = _http_get(f"https://open.spotify.com/embed/{kind}/{sid}")
+        tag = BeautifulSoup(html, "html.parser").find("script", id="__NEXT_DATA__")
+        if tag and (tag.string or tag.get_text()):
+            entity = _find_entity(json.loads(tag.string or tag.get_text()), kind, sid)
+            if entity:
+                result = parse_embed_entity(entity, kind, sid)
+                if result["tracks"]:
+                    return result
+        log.warning("Halaman embed %s/%s tidak berisi data lagu, pakai fallback OpenGraph.", kind, sid)
+    except requests.HTTPError:
+        raise
+    except Exception as exc:
+        log.warning("Parsing embed gagal (%r), pakai fallback OpenGraph.", exc)
+
+    og = parse_open_graph(_http_get(f"https://open.spotify.com/{kind}/{sid}"))
+    artists = [og["artist"]] if og["artist"] else []
+    if kind == "track":
+        tracks = [{"id": sid, "name": og["title"] or "", "artists": artists, "duration": 0}]
+    else:
+        def one(tid: str) -> dict:
+            try:
+                t = parse_open_graph(_http_get(f"https://open.spotify.com/track/{tid}"))
+                return {"id": tid, "name": t["title"] or "", "artists": [t["artist"]] if t["artist"] else [], "duration": 0}
+            except Exception:
+                return {"id": tid, "name": "", "artists": [], "duration": 0}
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            tracks = [t for t in pool.map(one, og["track_ids"][:200]) if t["name"]]
+    return {
+        "kind": kind,
+        "title": og["title"],
+        "artist": og["artist"],
+        "year": None,
+        "cover_url": og["cover_url"],
+        "tracks": tracks,
+        "source": "opengraph",
+    }
 
 
 ALBUM_CACHE: dict[str, tuple[float, dict]] = {}
 ALBUM_CACHE_TTL = 3600  # 1 jam
+ALBUM_CACHE_MAX = 500
+_INFLIGHT: dict[str, asyncio.Task] = {}  # request identik yang sedang berjalan digabung
 
 
+# --------------------------------------------------------------------------- #
+# Cache audio (cache_audio/{track_id}.{format})
+# --------------------------------------------------------------------------- #
+_BAD_FN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_filename(name: str) -> str:
+    return _BAD_FN_CHARS.sub("_", name).strip(" .")[:150] or "track"
+
+
+def unique_path(folder: Path, stem: str, ext: str, track_id: str) -> Path:
+    p = folder / f"{stem}.{ext}"
+    if p.exists():
+        p = folder / f"{stem} [{track_id[:6]}].{ext}"
+    return p
+
+
+def cache_path(track_id: str) -> Path:
+    return CACHE_DIR / f"{track_id}.{AUDIO_FORMAT}"
+
+
+def cache_put(track_id: str, src: Path) -> None:
+    """Simpan salinan ke cache secara atomik (aman bila ada proses lain yang membaca)."""
+    if not TRACK_ID_RE.match(track_id):
+        return
+    try:
+        tmp = CACHE_DIR / f".{uuid.uuid4().hex}.part"
+        shutil.copy2(src, tmp)
+        os.replace(tmp, cache_path(track_id))
+    except OSError as exc:
+        log.warning("Gagal menyimpan cache %s: %s", track_id, exc)
+
+
+def restore_from_cache(
+    selected_ids: list[str], track_meta: dict[str, dict], out_dir: Path
+) -> tuple[list[str], list[str]]:
+    """
+    Salin lagu yang sudah ada di cache ke folder sesi.
+    PENTING: disalin (bukan hardlink), karena custom cover ditulis mutagen langsung
+    ke file di folder sesi; hardlink akan ikut merusak file cache.
+    """
+    hits, misses = [], []
+    for tid in selected_ids:
+        src = cache_path(tid)
+        if TRACK_ID_RE.match(tid) and src.is_file():
+            meta = track_meta.get(tid) or {}
+            artists = ", ".join(meta.get("artists") or [])
+            stem = safe_filename(f"{artists} - {meta.get('name')}" if artists else (meta.get("name") or tid))
+            dest = unique_path(out_dir, stem, AUDIO_FORMAT, tid)
+            try:
+                shutil.copy2(src, dest)
+                os.utime(src, None)  # tandai baru dipakai (untuk pruning LRU)
+                hits.append(tid)
+                continue
+            except OSError as exc:
+                log.warning("Cache %s rusak/tidak terbaca: %s", tid, exc)
+                src.unlink(missing_ok=True)
+        misses.append(tid)
+    return hits, misses
+
+
+def prune_cache() -> None:
+    """Hapus file cache paling lama tidak dipakai sampai ukuran di bawah batas."""
+    if CACHE_MAX_BYTES <= 0:
+        return
+    try:
+        files = [(f, f.stat()) for f in CACHE_DIR.iterdir() if f.is_file()]
+    except OSError:
+        return
+    total = sum(st.st_size for _, st in files)
+    if total <= CACHE_MAX_BYTES:
+        return
+    for f, st in sorted(files, key=lambda x: x[1].st_mtime):
+        f.unlink(missing_ok=True)
+        total -= st.st_size
+        if total <= CACHE_MAX_BYTES * 0.9:
+            break
+
+
+# --------------------------------------------------------------------------- #
+# SSE helper
+# --------------------------------------------------------------------------- #
 async def emit(
     session_id: str,
     message: str,
@@ -229,82 +609,73 @@ def quota_exceeded_message(st: dict, album_total: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Modul 1: Download
+# Modul 1: Download (cache -> yt-dlp paralel)
 # --------------------------------------------------------------------------- #
 async def download_spotify_album(
-    spotify_url: str, session_id: str, selected_ids: set[str]
+    spotify_url: str,
+    session_id: str,
+    selected_ids: list[str],
+    track_meta: dict[str, dict],
+    album_meta: dict,
 ) -> tuple[Path, list[str]]:
     """
-    Unduh lagu yang ada di `selected_ids` (hasil jatah kuota) ke ./downloads/{session_id}/.
+    Siapkan lagu di `selected_ids` (hasil jatah kuota) ke ./downloads/{session_id}/.
 
-    spotdl bersifat sinkron/blocking, jadi dijalankan di thread terpisah dan
-    progress per lagu dikirim balik ke event loop lewat `emit`.
-    Mengembalikan (folder hasil unduhan, daftar track_id yang BERHASIL).
+    1. Lagu yang sudah ada di cache_audio/ langsung disalin.
+    2. Sisanya dicari di YouTube ("ytsearch1:<artis> - <judul>") dan diunduh dengan
+       yt-dlp, `DOWNLOAD_THREADS` lagu sekaligus, lalu dikonversi ke AUDIO_FORMAT.
+
+    Mengembalikan (folder hasil, daftar track_id yang BERHASIL).
     """
     out_dir = DOWNLOADS_DIR / session_id
     out_dir.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_running_loop()
 
-    def push(message: str, level: str = "info") -> None:
-        asyncio.run_coroutine_threadsafe(
-            emit(session_id, message, level=level), loop
-        )
+    # ---- Tahap 1: cek cache ------------------------------------------------
+    hit_ids, miss_ids = await asyncio.to_thread(restore_from_cache, selected_ids, track_meta, out_dir)
+    if hit_ids:
+        await emit(session_id, f"{len(hit_ids)} lagu ditemukan di cache, langsung dipakai.")
+    if not miss_ids:
+        return out_dir, hit_ids
 
-    def worker() -> list[str]:
-        client = get_spotdl()
+    # ---- Tahap 2: unduh sisanya via yt-dlp (paralel) -----------------------
+    work_dir = DOWNLOADS_DIR / "_tmp" / session_id
+    work_dir.mkdir(parents=True, exist_ok=True)
+    cover_art = await asyncio.to_thread(_fetch_cover, album_meta.get("cover_url")) if AUDIO_FORMAT == "mp3" else None
 
-        push("Mengambil metadata dari Spotify...")
+    total = len(miss_ids)
+    done = 0
+    await emit(session_id, f"Mengunduh {total} lagu baru ({DOWNLOAD_THREADS} lagu sekaligus)...")
+
+    async def one(tid: str) -> str | None:
+        nonlocal done
+        meta = track_meta.get(tid) or {}
+        label = _search_query(meta) or tid
         try:
-            songs = client.search([spotify_url])
-        except RequestException as exc:
-            raise DownloadError(
-                "Gagal terhubung ke Spotify (kesalahan jaringan). Coba lagi nanti."
-            ) from exc
-        except Exception as exc:  # spotdl melempar beberapa jenis error
-            log.warning("Search gagal untuk %s: %s", spotify_url, exc)
-            raise DownloadError(
-                "Link Spotify tidak ditemukan atau tidak dapat diakses."
-            ) from exc
+            await asyncio.wait_for(
+                loop.run_in_executor(
+                    DL_POOL, _process_track, tid, meta, album_meta, cover_art, work_dir, out_dir
+                ),
+                timeout=TRACK_TIMEOUT + 90,  # pengaman terakhir kalau thread macet
+            )
+        except Exception as exc:  # satu lagu gagal tidak menghentikan yang lain
+            done += 1
+            log.warning("Gagal mengunduh %s: %r", label, exc)
+            await emit(session_id, f"[{done}/{total}] Gagal: {label}", level="warning")
+            return None
+        done += 1
+        await emit(session_id, f"[{done}/{total}] Selesai: {label}")
+        return tid
 
-        if not songs:
-            raise DownloadError("Tidak ada lagu yang ditemukan pada link tersebut.")
+    try:
+        results = await asyncio.gather(*(one(t) for t in miss_ids))
+    finally:
+        await asyncio.to_thread(shutil.rmtree, work_dir, True)
+    new_ids = [t for t in results if t]
+    await emit(session_id, f"Unduhan selesai: {len(new_ids)}/{total} lagu baru berhasil.")
+    await asyncio.to_thread(prune_cache)
 
-        found = len(songs)
-        songs = [s for s in songs if s.song_id in selected_ids]  # sesuai jatah kuota
-        if not songs:
-            raise DownloadError("Tidak ada lagu yang cocok dengan jatah unduhanmu.")
-
-        total = len(songs)
-        if total < found:
-            push(f"Ditemukan {found} lagu. Mengunduh {total} lagu sesuai sisa kuota...")
-        else:
-            push(f"Ditemukan {total} lagu. Mulai mengunduh...")
-
-        ok_ids: list[str] = []
-        for index, song in enumerate(songs, start=1):
-            label = f"{song.artist} - {song.name}"
-            push(f"[{index}/{total}] Mengunduh: {label}")
-            try:
-                _, path = client.download(song)
-            except RequestException:
-                push(f"[{index}/{total}] Gagal (jaringan): {label}", "warning")
-                continue
-            except Exception as exc:
-                log.warning("Gagal mengunduh %s: %s", label, exc)
-                push(f"[{index}/{total}] Gagal: {label}", "warning")
-                continue
-
-            if path is None:
-                push(f"[{index}/{total}] Dilewati (tidak ditemukan): {label}", "warning")
-            else:
-                shutil.move(str(path), str(out_dir / Path(path).name))  # pindah ke folder sesi
-                ok_ids.append(song.song_id)
-                push(f"[{index}/{total}] Selesai: {label}")
-
-        push(f"Unduhan selesai: {len(ok_ids)}/{total} lagu berhasil.")
-        return ok_ids
-
-    success_ids = await loop.run_in_executor(SPOTDL_EXECUTOR, worker)
+    success_ids = hit_ids + new_ids
     if not success_ids:
         raise DownloadError("Semua lagu gagal diunduh. Periksa koneksi atau coba lagi.")
     return out_dir, success_ids
@@ -314,13 +685,19 @@ async def download_spotify_album(
 # Modul 2: Zip & Cleanup
 # --------------------------------------------------------------------------- #
 async def create_zip(session_id: str) -> Path:
-    """Kompres ./downloads/{id}/ -> ./zips/{id}.zip lalu hapus folder mentah."""
+    """Bungkus ./downloads/{id}/ -> ./zips/{id}.zip (ZIP_STORED, tanpa kompresi)."""
     src_dir = DOWNLOADS_DIR / session_id
     zip_path = ZIPS_DIR / f"{session_id}.zip"
 
     def _zip() -> Path:
         ZIPS_DIR.mkdir(parents=True, exist_ok=True)
-        shutil.make_archive(str(ZIPS_DIR / session_id), "zip", root_dir=src_dir)
+        part = ZIPS_DIR / f"{session_id}.zip.part"
+        # Audio sudah terkompresi, jadi ZIP_STORED = instan & ukuran hampir sama
+        with zipfile.ZipFile(part, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+            for f in sorted(src_dir.iterdir()):
+                if f.is_file():
+                    zf.write(f, arcname=f.name)
+        part.replace(zip_path)
         shutil.rmtree(src_dir, ignore_errors=True)  # hanya setelah zip sukses
         return zip_path
 
@@ -347,9 +724,11 @@ async def process_session(
     spotify_url: str,
     user_id: str,
     plan: dict,
-    cover_bytes: bytes | None = None,  # <- baru
+    cover_bytes: bytes | None = None,
+    track_meta: dict[str, dict] | None = None,
+    album_meta: dict | None = None,
 ) -> None:
-    """Pipeline: download -> (embed cover) -> zip -> catat kuota -> jadwalkan penghapusan."""
+    """Pipeline: cache/download -> (embed cover) -> zip -> catat kuota -> jadwalkan penghapusan."""
     session = SESSIONS.get(session_id)
     if session is None:
         await asyncio.to_thread(quota.release, session_id)
@@ -359,10 +738,10 @@ async def process_session(
     try:
         await emit(session_id, "Memulai proses...", status="downloading")
         _, success_ids = await download_spotify_album(
-            spotify_url, session_id, set(plan["selected_ids"])
+            spotify_url, session_id, list(plan["selected_ids"]), track_meta or {}, album_meta or {}
         )
 
-        # --- baru: sematkan custom cover (Premium) ---
+        # --- sematkan custom cover (Premium) via mutagen, hanya pada salinan di folder sesi ---
         print(
             f"[PIPELINE] {session_id[:8]} | cover_bytes={'ada, ' + str(len(cover_bytes)) + ' byte' if cover_bytes else 'None'} "
             f"| AUDIO_FORMAT={AUDIO_FORMAT}",
@@ -389,7 +768,7 @@ async def process_session(
                 await emit(session_id, f"Custom cover disematkan ke {ok} lagu.")
         # ---------------------------------------------
 
-        await emit(session_id, "Mengompresi file menjadi ZIP...", status="zipping")
+        await emit(session_id, "Membungkus file menjadi ZIP...", status="zipping")
         await create_zip(session_id)
 
         # Kuota baru dipotong setelah ZIP benar-benar siap; hanya lagu yang berhasil
@@ -436,12 +815,15 @@ async def job_worker() -> None:
 
 
 def purge_stale_files() -> None:
-    """Saat startup: sesi in-memory hilang, jadi semua file sisa tidak bisa diakses lagi -> hapus."""
-    for zip_file in ZIPS_DIR.glob("*.zip"):
+    """Saat startup: sesi in-memory hilang, jadi semua file sisa tidak bisa diakses lagi -> hapus.
+    (cache_audio/ sengaja TIDAK dihapus.)"""
+    for zip_file in ZIPS_DIR.glob("*.zip*"):
         zip_file.unlink(missing_ok=True)
     for folder in DOWNLOADS_DIR.iterdir():
         if folder.is_dir():
             shutil.rmtree(folder, ignore_errors=True)
+    for part in CACHE_DIR.glob(".*.part"):  # sisa penulisan cache yang terputus
+        part.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -452,10 +834,16 @@ async def lifespan(_: FastAPI):
     global JOB_QUEUE
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     ZIPS_DIR.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
     purge_stale_files()
+    prune_cache()
     init_db()
     quota.clear_reservations()
     (DOWNLOADS_DIR / "_tmp").mkdir(parents=True, exist_ok=True)
+
+    if not shutil.which("ffmpeg") and not FFMPEG_LOCATION:
+        log.error("ffmpeg TIDAK ditemukan. Pasang ffmpeg (dan pastikan ada di PATH), "
+                  "kalau tidak konversi ke %s akan gagal.", AUDIO_FORMAT)
 
     JOB_QUEUE = asyncio.PriorityQueue()
     _WORKERS.extend(asyncio.create_task(job_worker()) for _ in range(MAX_CONCURRENT_JOBS))
@@ -484,7 +872,6 @@ app.add_middleware(
 )
 
 app.include_router(payments_router)
-app.include_router(pages_router)
 
 
 @app.post("/api/download")
@@ -532,10 +919,11 @@ async def start_download(
         finally:
             await cover_image.close()
 
-    # 2. Ambil daftar lagu (dari cache album-info kalau ada)
+    # 2. Ambil daftar lagu (dari cache metadata / scraping)
     _, _, url = parse_spotify_url(url)
     info = await fetch_album_info(url)
-    track_ids = [t["id"] for t in info["tracks"] if t.get("id")]
+    track_meta = {t["id"]: t for t in info["tracks"] if t.get("id")}
+    track_ids = list(track_meta)
     if not track_ids:
         raise HTTPException(status_code=404, detail="Tidak ada lagu yang ditemukan pada link tersebut.")
 
@@ -578,7 +966,15 @@ async def start_download(
                 "spotify_url": url,
                 "user_id": user["id"],
                 "plan": plan,
-                "cover_bytes": cover_bytes,  # <- baru
+                "cover_bytes": cover_bytes,
+                "track_meta": track_meta,
+                "album_meta": {
+                    "kind": info.get("kind"),
+                    "title": info.get("title"),
+                    "artist": info.get("artist"),
+                    "year": info.get("year"),
+                    "cover_url": info.get("cover_url"),
+                },
             },
         ))
     except Exception:
@@ -774,6 +1170,7 @@ async def qris_page(request: Request):
         raise HTTPException(status_code=404, detail="static/qris.html tidak ditemukan.")
     return FileResponse(page)
 
+
 @app.get("/premium/kartu", include_in_schema=False)
 async def kartu_page(request: Request):
     if not request.session.get("user"):
@@ -781,6 +1178,16 @@ async def kartu_page(request: Request):
     page = STATIC_DIR / "kartu.html"
     if not page.is_file():
         raise HTTPException(status_code=404, detail="static/kartu.html tidak ditemukan.")
+    return FileResponse(page)
+
+
+@app.get("/pembayaran/proses", include_in_schema=False)
+async def pembayaran_proses(request: Request):
+    if not request.session.get("user"):
+        return RedirectResponse("/")
+    page = STATIC_DIR / "proses.html"
+    if not page.is_file():
+        raise HTTPException(status_code=404, detail="static/proses.html tidak ditemukan.")
     return FileResponse(page)
 
 
@@ -818,91 +1225,69 @@ async def pembayaran_sukses(request: Request, order_id: str = ""):
 
 
 # --------------------------------------------------------------------------- #
-# Info album (publik, tanpa login)
+# Load / info album (publik, tanpa login) - scraping halaman Spotify
 # --------------------------------------------------------------------------- #
+async def _load_from_spotify(kind: str, sid: str, url: str) -> dict:
+    loop = asyncio.get_running_loop()
+    t0 = time.perf_counter()
+    try:
+        result = await loop.run_in_executor(META_EXECUTOR, _scrape_sync, kind, sid)
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        log.warning("Scraping HTTP %s untuk %s", status, url)
+        if status in (400, 404):
+            raise HTTPException(status_code=404, detail="Link Spotify tidak ditemukan atau tidak dapat diakses.")
+        if status == 429:
+            raise HTTPException(status_code=503, detail="Spotify sedang membatasi permintaan. Coba lagi sebentar lagi.")
+        raise HTTPException(status_code=502, detail="Gagal mengambil data dari Spotify. Coba lagi nanti.")
+    except (RequestException, ValueError) as exc:
+        log.warning("Scraping gagal untuk %s: %r", url, exc)
+        raise HTTPException(status_code=502, detail="Gagal terhubung ke Spotify. Coba lagi nanti.")
+
+    if not result["tracks"]:
+        raise HTTPException(
+            status_code=404,
+            detail="Tidak ada lagu yang ditemukan pada link tersebut (atau format halaman Spotify berubah).",
+        )
+    log.info("load %s via %s: %d lagu dalam %.2f detik", kind, result.get("source"), len(result["tracks"]), time.perf_counter() - t0)
+    return result
+
+
 async def fetch_album_info(url: str) -> dict:
-    """Ambil info album/playlist/track (dengan cache). `url` harus sudah dibersihkan."""
+    """Ambil info album/playlist/track (cache + scraping). `url` harus sudah dibersihkan."""
     match = SPOTIFY_URL_RE.match(url)
     if not match:
         raise HTTPException(status_code=400, detail="URL tidak valid. Gunakan link Spotify.")
 
-    kind = match.group("kind")
     cached = ALBUM_CACHE.get(url)
     if cached and time.time() - cached[0] < ALBUM_CACHE_TTL:
         return cached[1]
 
-    loop = asyncio.get_running_loop()
-    t0 = time.perf_counter()
-    result = None
+    # Request identik yang sedang berjalan digabung jadi satu panggilan ke Spotify
+    task = _INFLIGHT.get(url)
+    if task is None:
+        task = asyncio.create_task(_load_from_spotify(match.group("kind"), match.group("id"), url))
+        _INFLIGHT[url] = task
+        task.add_done_callback(lambda _t, u=url: _INFLIGHT.pop(u, None))
+    result = await asyncio.shield(task)
 
-    # Jalur cepat untuk album: satu panggilan ke Spotify
-    if kind == "album":
-        def _fast():
-            from spotdl.utils.spotify import SpotifyClient
-            get_spotdl()  # pastikan koneksi Spotify sudah dibuat
-            sp = SpotifyClient()
-            data = sp.album(match.group("id"))
-            tracks_obj = data.get("tracks") or {}
-
-            items = list(tracks_obj.get("items", []))
-            page = tracks_obj
-            while page.get("next"):          # ikuti halaman berikutnya kalau ada
-                page = sp.next(page)
-                items.extend(page.get("items", []))
-            if not items:
-                raise ValueError("daftar lagu kosong")
-            total = data.get("total_tracks")
-            if total and len(items) < total:
-                raise ValueError(f"daftar lagu tidak lengkap ({len(items)}/{total})")
-
-            return {
-                "title": data.get("name"),
-                "artist": ", ".join(a["name"] for a in data.get("artists", []) if a.get("name")),
-                "year": int(data["release_date"][:4]) if data.get("release_date") else None,
-                "cover_url": data["images"][0]["url"] if data.get("images") else None,
-                "tracks": [
-                    {"id": t.get("id"), "name": t.get("name"), "duration": (t.get("duration_ms") or 0) // 1000}
-                    for t in items
-                ],
-            }
-
-        try:
-            result = await loop.run_in_executor(SPOTDL_EXECUTOR, _fast)
-            log.info("album-info (jalur cepat): %.1f detik", time.perf_counter() - t0)
-        except Exception as exc:
-            log.warning("Jalur cepat gagal (%r), memakai spotdl.", exc)
-
-    # Jalur lama lewat spotdl (playlist/track, atau kalau jalur cepat gagal)
-    if result is None:
-        def _fetch():
-            return get_spotdl().search([url])
-
-        try:
-            songs = await loop.run_in_executor(SPOTDL_EXECUTOR, _fetch)
-        except RequestException:
-            raise HTTPException(status_code=502, detail="Gagal terhubung ke Spotify. Coba lagi nanti.")
-        except Exception as exc:
-            log.warning("album-info gagal untuk %s: %r", url, exc, exc_info=True)
-            raise HTTPException(status_code=404, detail="Link Spotify tidak ditemukan atau tidak dapat diakses.")
-        if not songs:
-            raise HTTPException(status_code=404, detail="Tidak ada lagu yang ditemukan pada link tersebut.")
-
-        first = songs[0]
-        title = {"album": first.album_name, "playlist": first.list_name, "track": first.name}[kind] or first.album_name
-        result = {
-            "title": title,
-            "artist": first.album_artist or first.artist,
-            "year": first.year,
-            "cover_url": first.cover_url,
-            "tracks": [{"id": s.song_id, "name": s.name, "duration": s.duration} for s in songs],
-        }
-        log.info("album-info (spotdl): %d lagu dalam %.1f detik", len(songs), time.perf_counter() - t0)
-
+    if len(ALBUM_CACHE) >= ALBUM_CACHE_MAX:  # buang entri kedaluwarsa / terlama
+        now = time.time()
+        for k in [k for k, (ts, _) in ALBUM_CACHE.items() if now - ts >= ALBUM_CACHE_TTL]:
+            ALBUM_CACHE.pop(k, None)
+        while len(ALBUM_CACHE) >= ALBUM_CACHE_MAX:
+            ALBUM_CACHE.pop(min(ALBUM_CACHE, key=lambda k: ALBUM_CACHE[k][0]))
     ALBUM_CACHE[url] = (time.time(), result)
     return result
 
 
-@app.get("/api/album-info")
+@app.get("/api/load")
+async def load_link(url: str):
+    _, _, clean = parse_spotify_url(url)
+    return await fetch_album_info(clean)
+
+
+@app.get("/api/album-info")  # alias lama, tetap didukung frontend yang ada
 async def album_info(url: str):
     _, _, clean = parse_spotify_url(url)
     return await fetch_album_info(clean)

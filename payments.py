@@ -14,6 +14,31 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 import db
+import stripe
+from fastapi.responses import RedirectResponse
+
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_CURRENCY = os.getenv("STRIPE_CURRENCY", "idr")
+USD_RATE = int(os.getenv("USD_RATE", "16000"))
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+PAYPAL_CLIENT_ID = os.getenv("PAYPAL_CLIENT_ID", "")
+PAYPAL_SECRET = os.getenv("PAYPAL_SECRET", "")
+PAYPAL_API = ("https://api-m.paypal.com" if os.getenv("PAYPAL_PRODUCTION", "").lower() == "true"
+              else "https://api-m.sandbox.paypal.com")
+
+
+def _is_midtrans_order(order_id: str) -> bool:
+    return "-S-" not in order_id and "-P-" not in order_id
+
+
+def _mark_paid(order_id: str, source: str) -> None:
+    order = db.get_order(order_id)
+    if order and order["status"] != "paid":
+        db.update_order_status(order_id, "paid")
+        _dbg(f"[{source}] {order_id}: -> paid | is_premium={db.is_premium(order['user_id'])} "
+             f"has_active_pass={db.has_active_pass(order['user_id'])}")
 import re
 from fastapi.responses import HTMLResponse
 
@@ -308,143 +333,156 @@ async def create_card(request: Request, body: CardIn, product: str = "premium"):
     return {"order_id": order_id, "product": product, "amount": amount, "method": "card",
             "status": fresh["status"], "redirect_url": redirect_url, "sandbox": not PRODUCTION}
 
-
-# ====================== SIMULASI PayPal / Stripe ======================
-SIM_PROVIDERS = {"paypal": "PayPal", "stripe": "Stripe"}
-SIM_LIFETIME = 15 * 60
-_SIM_ID = re.compile(r"^[A-Z]{3}-SIM[0-9a-f]{16}$")
-
-
-def _sim_guard(provider: str) -> None:
-    if provider not in SIM_PROVIDERS:
-        raise HTTPException(status_code=404, detail="Metode tidak dikenal.")
-    _require_enabled(provider)
-    if PRODUCTION:  # simulasi TIDAK BOLEH hidup di production
-        raise HTTPException(status_code=501, detail=f"{SIM_PROVIDERS[provider]} belum terintegrasi.")
-
-
-async def _create_sim_payment(request: Request, provider: str, product: str) -> dict:
-    _sim_guard(provider)
+@router.post("/stripe")
+async def create_stripe(request: Request, product: str = "premium"):
+    _require_enabled("stripe")
     user = _user(request)
     _check_can_buy(user, product)
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="STRIPE_SECRET_KEY belum diatur di server.")
 
     info = PRODUCTS[product]
-    amount = int(info["price"])
-    order_id = f"{info['prefix']}-SIM{uuid.uuid4().hex[:16]}"
-    expires_at = int(time.time()) + SIM_LIFETIME
-    redirect_url = f"/payments/{provider}/checkout?order_id={order_id}"
+    amount = int(info["price"])                      # harga dari server
+    order_id = f"{info['prefix']}-S-{uuid.uuid4().hex[:20]}"
+    expires_at = int(time.time()) + 30 * 60          # minimum Stripe: 30 menit
 
-    db.create_order(order_id, user["id"], amount, redirect_url, expires_at, product)
+    params = dict(
+        mode="payment",
+        client_reference_id=order_id,
+        line_items=[{"price_data": {
+            "currency": STRIPE_CURRENCY,
+            "product_data": {"name": PRODUCT_LABEL[product]},
+            "unit_amount": amount * 100,             # IDR di Stripe dikali 100
+        }, "quantity": 1}],
+        success_url=f"{APP_BASE_URL}/?payment=success&order_id={order_id}",
+        cancel_url=f"{APP_BASE_URL}/?payment=cancel",
+        expires_at=expires_at,
+    )
+    if user.get("email"):
+        params["customer_email"] = user["email"]
+
+    try:
+        session = await asyncio.to_thread(lambda: stripe.checkout.Session.create(**params))
+    except stripe.StripeError as e:
+        log.warning("Stripe gagal: %s", e)
+        raise HTTPException(status_code=502, detail="Gagal menghubungi Stripe. Coba lagi nanti.")
+
+    db.create_order(order_id, user["id"], amount, session.url, expires_at, product)
     await _cancel_other_pending(user["id"], product, keep_order_id=order_id)
-    _dbg(f"SIM {provider} order_id={order_id} amount={amount}")
-    return {"order_id": order_id, "product": product, "amount": amount, "method": provider,
-            "redirect_url": redirect_url, "expires_at": expires_at, "dummy": True, "sandbox": True}
+    return {"order_id": order_id, "product": product, "amount": amount, "method": "stripe",
+            "status": "pending", "url": session.url, "redirect_url": session.url}
+
+
+@router.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()                   # harus raw body
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Signature tidak valid.")
+
+    obj = event["data"]["object"]
+    order_id = obj.get("client_reference_id") or ""
+    order = db.get_order(order_id) if order_id else None
+    if not order:
+        return {"ok": True}
+
+    if event["type"] in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
+        if (obj.get("payment_status") == "paid"
+                and obj.get("amount_total") == int(order["amount"]) * 100
+                and obj.get("currency") == STRIPE_CURRENCY):
+            _mark_paid(order_id, "stripe")
+        else:
+            _dbg(f"[stripe] {order_id}: belum lunas / amount tidak cocok -> DIABAIKAN")
+    elif event["type"] == "checkout.session.expired" and order["status"] == "pending":
+        db.update_order_status(order_id, "expired")
+    return {"ok": True}
+
+
+def _paypal_token() -> str:
+    r = requests.post(f"{PAYPAL_API}/v1/oauth2/token", auth=(PAYPAL_CLIENT_ID, PAYPAL_SECRET),
+                      data={"grant_type": "client_credentials"}, timeout=20)
+    r.raise_for_status()
+    return r.json()["access_token"]
+
+
+def _usd(amount_idr) -> str:
+    return f"{int(amount_idr) / USD_RATE:.2f}"
 
 
 @router.post("/paypal")
 async def create_paypal(request: Request, product: str = "premium"):
-    # TODO produksi: PayPal Orders v2 (intent=CAPTURE) + webhook PAYMENT.CAPTURE.COMPLETED.
-    # PayPal tidak mendukung IDR -> konversi ke USD.
-    return await _create_sim_payment(request, "paypal", product)
-
-
-@router.post("/stripe")
-async def create_stripe(request: Request, product: str = "premium"):
-    # TODO produksi: stripe.checkout.Session.create(currency="idr", metadata={"order_id": ...})
-    # + webhook checkout.session.completed (verifikasi Stripe-Signature).
-    return await _create_sim_payment(request, "stripe", product)
-
-
-def _load_sim_order(request: Request, provider: str, order_id: str) -> dict:
-    _sim_guard(provider)
+    _require_enabled("paypal")
     user = _user(request)
-    if not _SIM_ID.match(order_id):          # hanya order simulasi, bukan order Midtrans asli
-        raise HTTPException(status_code=400, detail="Order bukan order simulasi.")
-    order = db.get_order(order_id)
-    if not order or order["user_id"] != user["id"]:
-        raise HTTPException(status_code=404, detail="Order tidak ditemukan.")
-    return order
+    _check_can_buy(user, product)
+    if not (PAYPAL_CLIENT_ID and PAYPAL_SECRET):
+        raise HTTPException(status_code=500, detail="Kredensial PayPal belum diatur di server.")
+
+    info = PRODUCTS[product]
+    amount = int(info["price"])
+    order_id = f"{info['prefix']}-P-{uuid.uuid4().hex[:20]}"
+
+    def _create():
+        token = _paypal_token()
+        r = requests.post(
+            f"{PAYPAL_API}/v2/checkout/orders",
+            headers={"Authorization": f"Bearer {token}"}, timeout=20,
+            json={"intent": "CAPTURE",
+                  "purchase_units": [{"reference_id": order_id,
+                                      "description": PRODUCT_LABEL[product],
+                                      "amount": {"currency_code": "USD", "value": _usd(amount)}}],
+                  "application_context": {
+                      "return_url": f"{APP_BASE_URL}/api/payments/paypal/return",
+                      "cancel_url": f"{APP_BASE_URL}/?payment=cancel",
+                      "user_action": "PAY_NOW"}})
+        r.raise_for_status()
+        return r.json()
+
+    try:
+        data = await asyncio.to_thread(_create)
+    except requests.RequestException as e:
+        log.warning("PayPal gagal: %r", e)
+        raise HTTPException(status_code=502, detail="Gagal menghubungi PayPal. Coba lagi nanti.")
+
+    approve = next((l["href"] for l in data.get("links", []) if l["rel"] in ("approve", "payer-action")), "")
+    if not approve:
+        raise HTTPException(status_code=502, detail="PayPal tidak memberi link pembayaran.")
+
+    db.create_order(order_id, user["id"], amount, approve, int(time.time()) + 3 * 3600, product)
+    await _cancel_other_pending(user["id"], product, keep_order_id=order_id)
+    return {"order_id": order_id, "product": product, "amount": amount, "method": "paypal",
+            "status": "pending", "url": approve, "redirect_url": approve}
 
 
-pages_router = APIRouter()   # tanpa prefix /api
+@router.get("/paypal/return")
+async def paypal_return(token: str):
+    """PayPal mengarahkan user ke sini setelah menyetujui; di sinilah uang benar-benar di-capture."""
+    def _capture():
+        t = _paypal_token()
+        r = requests.post(f"{PAYPAL_API}/v2/checkout/orders/{token}/capture",
+                          headers={"Authorization": f"Bearer {t}", "Content-Type": "application/json"},
+                          timeout=20)
+        return r.status_code, r.json()
 
-@pages_router.get("/payments/{provider}/checkout", response_class=HTMLResponse)
-async def checkout_page(provider: str, order_id: str, request: Request):
-    """Halaman checkout palsu. Status HANYA berubah lewat POST /api/payments/{provider}/success."""
-    order = _load_sim_order(request, provider, order_id)
-    name = SIM_PROVIDERS[provider]
-    product = PRODUCT_LABEL.get(order["product"], order["product"])
-    amt = f"{int(order['amount']):,}".replace(",", ".")
-    cfg = json.dumps({"provider": provider, "order_id": order_id})
-    color = "#0070ba" if provider == "paypal" else "#635bff"
-    return f"""<!DOCTYPE html><html lang="id"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Checkout {name} (Simulasi)</title>
-<style>
-body{{font-family:system-ui,sans-serif;background:#f3f4f7;margin:0;display:grid;place-items:center;min-height:100dvh}}
-.card{{background:#fff;border-radius:18px;box-shadow:0 8px 30px rgba(20,20,40,.12);padding:28px;width:min(420px,92vw);text-align:center}}
-h2{{margin:0 0 4px;color:{color}}} .badge{{display:inline-block;background:#fff3cd;color:#8a6d00;font-size:12px;font-weight:700;padding:3px 10px;border-radius:999px}}
-.row{{display:flex;justify-content:space-between;padding:12px 0;border-bottom:1px solid #eee;font-size:15px}}
-.total{{font-weight:800;font-size:20px;border:0}}
-button{{font:inherit;font-weight:700;width:100%;padding:13px;margin-top:12px;border:0;border-radius:12px;cursor:pointer}}
-.ok{{background:{color};color:#fff}} .no{{background:#e0e2e6}} button:disabled{{opacity:.6;cursor:wait}}
-#msg{{color:#d92d20;font-size:13px;min-height:18px;margin-top:10px}}
-</style></head><body><div class="card">
-<h2>{name}</h2><span class="badge">SIMULASI – tidak ada uang dipindahkan</span>
-<div style="margin-top:18px">
-<div class="row"><span>Produk</span><strong>{product}</strong></div>
-<div class="row"><span>Order</span><span style="font-size:12px">{order_id}</span></div>
-<div class="row total"><span>Total tagihan</span><span>Rp {amt}</span></div></div>
-<button class="ok" id="pay">Simulasikan Bayar Berhasil</button>
-<button class="no" id="cancel">Batalkan</button>
-<div id="msg"></div></div>
-<script>
-const c={cfg}, msg=document.getElementById('msg');
-async function go(path, done) {{
-  document.querySelectorAll('button').forEach(b=>b.disabled=true);
-  try {{
-    const r=await fetch('/api/payments/'+c.provider+'/'+path+'?order_id='+encodeURIComponent(c.order_id),{{method:'POST'}});
-    if(r.ok) {{ location.href=done; return; }}
-    const d=await r.json().catch(()=>({{}})); msg.textContent=d.detail||'Gagal.';
-  }} catch {{ msg.textContent='Koneksi bermasalah.'; }}
-  document.querySelectorAll('button').forEach(b=>b.disabled=false);
-}}
-document.getElementById('pay').onclick=()=>go('success','/?paid=1&order_id='+encodeURIComponent(c.order_id));
-document.getElementById('cancel').onclick=()=>go('cancel','/premium');
-</script></body></html>"""
+    try:
+        code, data = await asyncio.to_thread(_capture)
+    except requests.RequestException:
+        return RedirectResponse(f"{APP_BASE_URL}/?payment=error")
 
-@router.post("/{provider}/success")
-async def sim_success(provider: str, order_id: str, request: Request):
-    """Callback simulasi: menandai order lunas -> memberi Premium / Pass."""
-    order = _load_sim_order(request, provider, order_id)
-    if order["status"] == "paid":
-        return {"order_id": order_id, "product": order["product"], "status": "paid"}
-    if order["status"] != "pending":
-        raise HTTPException(status_code=409, detail="Order sudah tidak aktif.")
-
-    exp = dict(order).get("expires_at")
-    if exp and time.time() > float(exp):
-        db.update_order_status(order_id, "expired")
-        raise HTTPException(status_code=410, detail="Order kedaluwarsa.")
-
-    uid = order["user_id"]
-    # Cegah bayar ganda kalau user sudah lunas lewat metode lain
-    if (order["product"] == "premium" and db.is_premium(uid)) or \
-       (order["product"] == "pass" and db.has_active_pass(uid)):
-        db.update_order_status(order_id, "failed")
-        raise HTTPException(status_code=409, detail="Paket ini sudah aktif di akun kamu.")
-
-    db.update_order_status(order_id, "paid")
-    _dbg(f"[sim-{provider}] {order_id}: pending -> paid | produk={order['product']} | "
-         f"is_premium={db.is_premium(uid)} has_active_pass={db.has_active_pass(uid)}")
-    return {"order_id": order_id, "product": order["product"], "status": "paid"}
-
-
-@router.post("/{provider}/cancel")
-async def sim_cancel(provider: str, order_id: str, request: Request):
-    order = _load_sim_order(request, provider, order_id)
-    if order["status"] == "pending":
-        db.update_order_status(order_id, "failed")
-    return {"order_id": order_id, "status": "failed"}
+    pu = (data.get("purchase_units") or [{}])[0]
+    order_id = pu.get("reference_id", "")
+    order = db.get_order(order_id) if order_id else None
+    if order and data.get("status") == "COMPLETED":
+        cap = ((pu.get("payments") or {}).get("captures") or [{}])[0]
+        if cap.get("amount", {}).get("value") == _usd(order["amount"]) \
+                and cap.get("amount", {}).get("currency_code") == "USD":
+            _mark_paid(order_id, "paypal")
+            return RedirectResponse(f"{APP_BASE_URL}/?payment=success&order_id={order_id}")
+        _dbg(f"[paypal] {order_id}: amount tidak cocok -> DIABAIKAN")
+    elif order and order["status"] == "paid":        # halaman di-refresh
+        return RedirectResponse(f"{APP_BASE_URL}/?payment=success&order_id={order_id}")
+    return RedirectResponse(f"{APP_BASE_URL}/?payment=error")
 
 @router.get("/products")
 async def products():
@@ -506,7 +544,7 @@ async def order_status(order_id: str, request: Request):
     _dbg(f"POLL {order_id} | status lokal={order['status']!r} amount_db={order['amount']!r}")
 
     # Tanya Midtrans langsung, jadi tetap jalan di localhost walau webhook belum bisa masuk
-    if order["status"] == "pending":
+    if order["status"] == "pending" and _is_midtrans_order(order_id):
         try:
             data = await asyncio.to_thread(_call, "GET", f"/v2/{order_id}/status")
             _dbg(f"POLL {order_id} -> midtrans={data.get('transaction_status')} ({data.get('status_message')})")
