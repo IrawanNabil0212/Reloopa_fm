@@ -378,19 +378,25 @@ html.is-back::view-transition-old(root) { display: none; }
     position: relative; width: var(--rw);
   }
 
-  .rack::before {
+  /* bayangan lantai: elips padat, menempel di kaki rak */
+/* bayangan lantai: elips lembut, memudar penuh di tepi */
+.rack::before {
   content: ""; position: absolute; z-index: 0;
-  left: 9%; right: 9%; bottom: -1%; height: 9%;
-  background: radial-gradient(ellipse at center, rgba(0,0,0,.5) 0%, rgba(0,0,0,.22) 45%, transparent 72%);
-  filter: blur(6px);
+  left: 8%; width: 84%; bottom: 0; height: 10%;
+  background: radial-gradient(closest-side,
+    rgba(0,0,0,.55) 0%,
+    rgba(0,0,0,.45) 35%,
+    rgba(0,0,0,.2)  70%,
+    rgba(0,0,0,0)   100%);
+  filter: blur(3px);
   pointer-events: none;
-  }
-  .rack-img {
-    position: relative; z-index: 2;
-    display: block; width: 100%; height: auto;
-    user-select: none; -webkit-user-drag: none; pointer-events: none;
-    filter: drop-shadow(0px 10px 14px rgba(0, 0, 0, 0.22));  /* lebih tipis, bayangan utama ada di ::before */
-  }
+}
+.rack-img {
+  position: relative; z-index: 2;
+  display: block; width: 100%; height: auto;
+  user-select: none; -webkit-user-drag: none; pointer-events: none;
+  /* tanpa drop-shadow: di Figma tidak ada halo di sisi rak */
+}
 
   /* Sampul tersembunyi di balik tumpukan piringan */
   .rack > .flyer,
@@ -520,8 +526,8 @@ html.is-back::view-transition-old(root) { display: none; }
         </div>
         <!-- Penanda posisi sampul di dalam rak -->
         <div class="flyer-slot" id="flyerSlot"></div>
-        <img class="rack-img" src="static/img/vinyl-rack.png" alt="" width="537" height="464" decoding="async" draggable="false">
-      </div>
+        <img class="rack-img" src="/static/img/vinyl-rack.png" alt="" width="537" height="464" decoding="async" draggable="false">
+        </div>
     </section>
 <p class="credit">made by Reloopa Dev</p>
 </main>
@@ -594,7 +600,30 @@ function dockFlyerInRack() {
   flyer.classList.remove('fixed', 'in-slot', 'spinning');
 }
 function loadImage(src) {
-  return new Promise(res => { const i = new Image(); i.referrerPolicy = 'no-referrer'; i.onload = () => res(true); i.onerror = () => res(false); i.src = src; });
+  return new Promise(res => {
+    const i = new Image();
+    i.referrerPolicy = 'no-referrer';
+    i.onload = () => res(true);
+    i.onerror = () => res(false);
+    i.src = src;
+  });
+}
+
+function resetFlyCover() {
+  flyImg.classList.remove('ready');
+  flyImg.removeAttribute('src');
+}
+
+/* pasang cover asli: tunggu terunduh + ter-decode, lalu tunggu fade selesai supaya aman di-snapshot */
+async function showCover(src) {
+  if (!src) return false;
+  const ok = await loadImage(src);
+  if (!ok) return false;
+  flyImg.src = src;
+  try { await flyImg.decode(); } catch {}
+  flyImg.classList.add('ready');
+  await wait(300);
+  return true;
 }
 
 /* =========================================================
@@ -715,8 +744,17 @@ async function submitLink(v) {
   input.blur(); input.readOnly = true;
   setHint('mengambil data album...', 'loading');
 
-  const dataP = fetchAlbum(v);                        // data diambil sekarang, dibawa ke halaman album
-  dataP.catch(() => {});
+  const dataP = fetchAlbum(v);
+  resetFlyCover();
+  let fetchErr = null;
+  dataP.catch(e => { fetchErr = e; });
+  const coverP = dataP.then(d => showCover(d.cover_url)).catch(() => false);
+  await Promise.race([coverP, wait(900)]);
+  if (fetchErr) {
+  input.readOnly = false; setState('hero'); busy = false;
+  setHint(fetchErr.message, 'err'); input.focus();
+  return;
+}
 
   /* ---- TAHAP 1: sampul depan ditarik dari ujung rak, berputar naik, membesar ---- */
   const g = liftGeometry();
@@ -726,14 +764,12 @@ async function submitLink(v) {
   let data;
   try {
     await lift.finished;
-    data = await dataP;                               // album melayang sampai data siap
-    if (data.cover_url) {
-      const ok = await Promise.race([loadImage(data.cover_url), wait(1800).then(() => false)]);
-      if (ok) { flyImg.src = data.cover_url; flyImg.classList.add('ready'); }
-    }
+      data = await dataP;
+    await Promise.race([coverP, wait(5000)]);
   } catch (err) {
     lift.reverse(); await lift.finished; lift.cancel();
     dockFlyerInRack();
+    resetFlyCover();
     input.readOnly = false; setState('hero'); busy = false;
     setHint(err.message, 'err'); input.focus();
     return;
